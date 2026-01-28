@@ -54,19 +54,22 @@ class ExcelExporter:
     # 表头（按需求模板）
     HEADERS = ["定位ID", "定位点", "店铺名字", "商品分类", "商品名字", "月销量", "价格"]
     
-    def __init__(self, output_dir: str = "output", logger: Optional[DeviceLogger] = None):
+    def __init__(self, device_serial: str, base_output_dir: str = "output", logger: Optional[DeviceLogger] = None):
         """
         初始化导出器
         
         Args:
-            output_dir: 输出目录
+            device_serial: 设备序列号
+            base_output_dir: 输出根目录（如 "output"）
             logger: 日志器
         """
-        self.output_dir = output_dir
+        self.device_serial = device_serial
+        self.base_output_dir = base_output_dir
         self.logger = logger
         
-        # 创建输出目录
-        os.makedirs(output_dir, exist_ok=True)
+        # 使用 paths 模块创建目录: output/{serial}/results
+        from core import paths
+        self.results_dir = paths.results_dir(base_output_dir, device_serial)
         
         # 当前店铺的记录列表
         self.records: List[DrugRecord] = []
@@ -160,11 +163,10 @@ class ExcelExporter:
             self._log(f"店铺 [{shop_name}] 无数据，跳过导出", "warning")
             return None
         
-        # 生成安全的文件名
+        # 生成安全的文件名: output/{serial}/results/{shop_name}_{task_id}.xlsx
         safe_name = self.sanitize_filename(shop_name)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{safe_name}_{timestamp}.xlsx"
-        filepath = os.path.join(self.output_dir, filename)
+        filename = f"{safe_name}_{self.current_task_id}.xlsx"
+        filepath = os.path.join(self.results_dir, filename)
         
         try:
             self._log(f"正在导出: {filepath}")

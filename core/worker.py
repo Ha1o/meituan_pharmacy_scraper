@@ -11,6 +11,7 @@ from enum import Enum
 
 from core.logger import DeviceLogger
 from core.automator import DeviceAutomator
+from core.mock_automator import MockAutomator
 from core.selectors import SelectorHelper
 from core.task_loader import TaskLoader, Task
 from core.state_store import StateStore
@@ -37,23 +38,30 @@ class DeviceWorker:
     def __init__(
         self, 
         device_serial: str, 
-        output_dir: str = "output",
+        base_output_dir: str = "output",
         config_path: str = "config.json"
     ):
         self.device_serial = device_serial
-        self.output_dir = output_dir
+        self.base_output_dir = base_output_dir
         self.config_path = config_path
         
         # 加载配置
         self.config = self._load_config()
         
-        # 初始化组件
-        self.logger = DeviceLogger(device_serial, output_dir)
-        self.automator = DeviceAutomator(device_serial, self.logger, self.config)
+        # 初始化组件（传递 base_output_dir，由各模块自行拼接设备隔离路径）
+        self.logger = DeviceLogger(device_serial, base_output_dir)
+        
+        # Mock 模式：serial 以 MOCK- 开头则使用 MockAutomator
+        if device_serial.startswith("MOCK-"):
+            self.automator = MockAutomator(device_serial, self.logger, self.config)
+            self._is_mock = True
+        else:
+            self.automator = DeviceAutomator(device_serial, self.logger, self.config)
+            self._is_mock = False
         self.selector: Optional[SelectorHelper] = None
         self.task_loader = TaskLoader(self.logger)
-        self.state_store = StateStore(device_serial, output_dir)
-        self.exporter = ExcelExporter(output_dir, self.logger)
+        self.state_store = StateStore(device_serial, base_output_dir)
+        self.exporter = ExcelExporter(device_serial, base_output_dir, self.logger)
         
         # 线程控制
         self._thread: Optional[threading.Thread] = None
@@ -254,6 +262,10 @@ class DeviceWorker:
             
             self._update_progress()
             
+            # Mock 模式：使用简化采集流程
+            if self._is_mock:
+                return self._process_shop_mock(task)
+            
             # Step 1: 重启App
             self.logger.step("重启美团App")
             self.automator.stop_app()
@@ -379,6 +391,98 @@ class DeviceWorker:
             
         except Exception as e:
             self.logger.exception(f"处理店铺[{task.shop_name}]", e)
+            return False
+    
+    def _process_shop_mock(self, task: Task) -> bool:
+        """
+        Mock模式采集流程（简化版，不涉及真实设备操作）
+        
+        Args:
+            task: 任务对象
+            
+        Returns:
+            是否成功
+        """
+        try:
+            self.logger.step("[Mock] 模拟采集店铺", task.shop_name)
+            
+            # 模拟启动App
+            self.automator.start_app()
+            time.sleep(0.2)
+            
+            # 获取模拟分类列表
+            categories = self.automator.get_categories()
+            self.logger.info(f"[Mock] 获取到 {len(categories)} 个分类")
+            
+            # 遍历分类采集
+            for cat_idx, category in enumerate(categories):
+                if not self._check_control():
+                    return False
+                
+                self.current_category = category
+                self.state_store.current_category_name = category
+                self.state_store.current_category_index = cat_idx
+                self._update_progress()
+                
+                self.logger.info(f"[Mock] 采集分类: {category}")
+                
+                # 重置滚动位置
+                self.automator.reset_scroll_position()
+                
+                # 模拟滚动采集
+                scroll_count = 0
+                no_new_count = 0
+                max_scroll = 10
+                
+                while scroll_count < max_scroll:
+                    # 获取模拟商品数据
+                    products = self.automator.get_visible_products(category)
+                    
+                    if not products:
+                        no_new_count += 1
+                        if no_new_count >= 2:
+                            break
+                    else:
+                        no_new_count = 0
+                        
+                        # 处理商品
+                        for prod in products:
+                            shop_name = self.state_store.state.get("current_shop_name", "")
+                            key = self.state_store.generate_key(
+                                shop_name, category, prod["drug_name"], prod["price"]
+                            )
+                            
+                            if self.state_store.is_collected(key):
+                                continue
+                            
+                            # 创建记录
+                            record = create_drug_record(
+                                category_name=category,
+                                drug_name=prod["drug_name"],
+                                monthly_sales=prod.get("sales", "0"),
+                                price=prod["price"]
+                            )
+                            
+                            self.exporter.add_record(record)
+                            self.state_store.add_collected(key)
+                            self.collected_count += 1
+                            self._update_progress()
+                    
+                    # 模拟滑动
+                    self.automator.swipe_up()
+                    scroll_count += 1
+                    time.sleep(0.05)
+            
+            # 导出结果
+            filepath = self.exporter.export()
+            if filepath:
+                self.logger.info(f"[Mock] 店铺数据已导出: {filepath}")
+            
+            self.state_store.save()
+            return True
+            
+        except Exception as e:
+            self.logger.exception(f"[Mock] 处理店铺[{task.shop_name}]", e)
             return False
     
     def _resume_to_shop(self, task: Task) -> bool:
@@ -1347,7 +1451,9 @@ class DeviceWorker:
                         break
                 
                 # === 去重检查并保存 ===
-                key = self.state_store.generate_key(category_name, best_name, price_text)
+                # generate_key 必须包含 shop_name（从 state_store 获取）
+                shop_name = self.state_store.state.get("current_shop_name", "")
+                key = self.state_store.generate_key(shop_name, category_name, best_name, price_text)
                 
                 if self.state_store.is_collected(key):
                     continue

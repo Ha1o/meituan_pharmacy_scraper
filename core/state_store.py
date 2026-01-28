@@ -7,6 +7,8 @@ import json
 from typing import Set, Optional, Dict, Any
 from datetime import datetime
 
+from core import paths
+
 
 class StateStore:
     """
@@ -14,20 +16,22 @@ class StateStore:
     保存采集进度到JSON文件，支持断点续跑
     """
     
-    def __init__(self, device_serial: str, output_dir: str = "output"):
+    def __init__(self, device_serial: str, base_output_dir: str = "output"):
         """
         初始化状态存储器
         
         Args:
             device_serial: 设备序列号
-            output_dir: 输出目录
+            base_output_dir: 输出根目录（如 "output"）
         """
         self.device_serial = device_serial
-        self.state_dir = os.path.join(output_dir, "state")
-        os.makedirs(self.state_dir, exist_ok=True)
+        self.base_output_dir = base_output_dir
         
-        # 状态文件路径（设备级别）
-        self.state_file = os.path.join(self.state_dir, f"{device_serial}_state.json")
+        # 使用 paths 模块创建目录: output/{serial}/state
+        self.state_dir = paths.state_dir(base_output_dir, device_serial)
+        
+        # 状态文件路径: output/{serial}/state/state.json（固定文件名，不再用 serial 前缀）
+        self.state_file = paths.state_json_path(base_output_dir, device_serial)
         
         # 当前状态
         self.state: Dict[str, Any] = {
@@ -50,32 +54,30 @@ class StateStore:
     
     def generate_key(
         self, 
+        shop_name: str,
         category_name: str, 
         drug_name: str, 
-        price: str,
-        shop_name: str = ""
+        price: str
     ) -> str:
         """
-        生成去重key
+        生成去重key（必须包含shop_name，确保多店铺不冲突）
         
         Args:
+            shop_name: 店铺名（必填）
             category_name: 分类名
             drug_name: 药品名
             price: 价格
-            shop_name: 店铺名（可选）
             
         Returns:
-            去重key字符串
+            去重key字符串: shop_name|category|drug_name|price
         """
-        # 清理空格和特殊字符
+        # 清理空格和特殊字符，key格式: shop_name|category|drug_name|price
         parts = [
+            shop_name.strip(),
             category_name.strip(),
             drug_name.strip(),
             price.strip().replace('¥', '').replace('￥', '')
         ]
-        if shop_name:
-            parts.insert(0, shop_name.strip())
-        
         return "|".join(parts)
     
     def is_collected(self, key: str) -> bool:

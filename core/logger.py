@@ -7,6 +7,8 @@ import logging
 from datetime import datetime
 from typing import Optional
 
+from core import paths
+
 
 class DeviceLogger:
     """
@@ -14,31 +16,27 @@ class DeviceLogger:
     每台设备创建独立的日志文件和处理器
     """
     
-    def __init__(self, device_serial: str, output_dir: str = "output"):
+    def __init__(self, device_serial: str, base_output_dir: str = "output"):
         """
         初始化设备日志器
         
         Args:
             device_serial: 设备序列号
-            output_dir: 输出目录
+            base_output_dir: 输出根目录（如 "output"）
         """
         self.device_serial = device_serial
-        self.output_dir = output_dir
+        self.base_output_dir = base_output_dir
         
-        # 创建日志目录
-        self.log_dir = os.path.join(output_dir, "logs")
-        os.makedirs(self.log_dir, exist_ok=True)
-        
-        # 创建截图目录
-        self.screenshot_dir = os.path.join(output_dir, "screenshots", device_serial)
-        os.makedirs(self.screenshot_dir, exist_ok=True)
+        # 使用 paths 模块创建目录: output/{serial}/logs, output/{serial}/screenshots
+        self.log_dir = paths.logs_dir(base_output_dir, device_serial)
+        self.screenshot_dir = paths.screenshots_dir(base_output_dir, device_serial)
         
         # 配置日志器
         self.logger = logging.getLogger(f"device_{device_serial}")
         self.logger.setLevel(logging.DEBUG)
         self.logger.handlers.clear()  # 清除已有处理器
         
-        # 文件处理器
+        # 文件处理器: output/{serial}/logs/{serial}.log
         log_file = os.path.join(self.log_dir, f"{device_serial}.log")
         file_handler = logging.FileHandler(log_file, encoding='utf-8')
         file_handler.setLevel(logging.DEBUG)

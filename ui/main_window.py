@@ -120,6 +120,12 @@ class MainWindow(QMainWindow):
         
         layout.addStretch()
         
+        # Mock 并发压测按钮
+        self.btn_mock_test = QPushButton("🧪 Mock压测")
+        self.btn_mock_test.setStyleSheet("background-color: #6f42c1; color: white; padding: 5px 10px;")
+        self.btn_mock_test.clicked.connect(self._start_mock_test)
+        layout.addWidget(self.btn_mock_test)
+        
         # 设备统计
         self.lbl_device_count = QLabel("设备: 0台在线")
         layout.addWidget(self.lbl_device_count)
@@ -548,6 +554,45 @@ class MainWindow(QMainWindow):
             if item and item.text() == serial:
                 self.device_table.selectRow(row)
                 break
+    
+    def _start_mock_test(self):
+        """启动Mock并发压测"""
+        from PySide6.QtWidgets import QInputDialog
+        from core.task_loader import Task
+        
+        # 输入Mock数量
+        mock_count, ok = QInputDialog.getInt(
+            self, "Mock并发压测", "Mock设备数量:", 10, 1, 50, 1
+        )
+        if not ok:
+            return
+        
+        self.statusBar().showMessage(f"正在启动 {mock_count} 个Mock设备并发压测...")
+        
+        # 为每个Mock设备创建worker并启动
+        for i in range(1, mock_count + 1):
+            serial = f"MOCK-{i:03d}"
+            
+            # 创建worker
+            worker = self._get_or_create_worker(serial)
+            
+            # 内存中构造3个店铺任务（不需要xlsx文件）
+            mock_tasks = [
+                Task(index=0, poi="北京市朝阳区", shop_name=f"Mock药房{serial[-3:]}-A店", note=""),
+                Task(index=1, poi="北京市海淀区", shop_name=f"Mock药房{serial[-3:]}-B店", note=""),
+                Task(index=2, poi="北京市西城区", shop_name=f"Mock药房{serial[-3:]}-C店", note=""),
+            ]
+            worker.task_loader.tasks = mock_tasks
+            
+            # 启动worker
+            worker.start()
+        
+        QMessageBox.information(
+            self, "Mock压测已启动",
+            f"已启动 {mock_count} 个Mock设备并发运行。\n"
+            f"每个设备将采集3个模拟店铺。\n"
+            f"结果将输出到 output/MOCK-XXX/results/"
+        )
     
     def closeEvent(self, event):
         """关闭事件"""
