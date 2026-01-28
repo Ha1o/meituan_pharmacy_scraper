@@ -1,4 +1,5 @@
 {
+    "enable_debug_features": false,
     "app": {
         "package_name": "com.sankuai.meituan",
         "main_activity": "com.meituan.android.pt.homepage.activity.MainActivity",

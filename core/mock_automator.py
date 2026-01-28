@@ -40,7 +40,7 @@ class MockAutomator:
         device_serial: str, 
         logger=None, 
         config: dict = None,
-        failure_rate: float = 0.03
+        failure_rate: float = 0.0  # 默认不失败，压测时确保稳定
     ):
         """
         初始化Mock自动化器

@@ -4,6 +4,7 @@ main_window.py - PySide6 主界面
 """
 import os
 import sys
+import json
 from typing import Dict, Optional
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -120,11 +121,29 @@ class MainWindow(QMainWindow):
         
         layout.addStretch()
         
-        # Mock 并发压测按钮
-        self.btn_mock_test = QPushButton("🧪 Mock压测")
-        self.btn_mock_test.setStyleSheet("background-color: #6f42c1; color: white; padding: 5px 10px;")
-        self.btn_mock_test.clicked.connect(self._start_mock_test)
-        layout.addWidget(self.btn_mock_test)
+        # 加载配置判断是否显示调试功能
+        enable_debug = False
+        try:
+            if os.path.exists("config.json"):
+                with open("config.json", "r", encoding="utf-8") as f:
+                    config = json.load(f)
+                    enable_debug = config.get("enable_debug_features", False)
+        except Exception as e:
+            print(f"Error loading config: {e}")
+            
+        if enable_debug:
+            # Mock 并发压测按钮
+            self.btn_mock_test = QPushButton("🧪 Mock压测")
+            self.btn_mock_test.setStyleSheet("background-color: #6f42c1; color: white; padding: 5px 10px;")
+            self.btn_mock_test.clicked.connect(self._start_mock_test)
+            layout.addWidget(self.btn_mock_test)
+            
+            # 随机扰动测试按钮
+            self.btn_random_disturb = QPushButton("🎲 随机扰动")
+            self.btn_random_disturb.setStyleSheet("background-color: #fd7e14; color: white; padding: 5px 10px;")
+            self.btn_random_disturb.clicked.connect(self._random_disturb_test)
+            self.btn_random_disturb.setToolTip("随机暂停/恢复一个Mock设备，验证线程独立性")
+            layout.addWidget(self.btn_random_disturb)
         
         # 设备统计
         self.lbl_device_count = QLabel("设备: 0台在线")
@@ -307,6 +326,10 @@ class MainWindow(QMainWindow):
         # 更新按钮状态
         if serial == self.current_device:
             self._update_control_buttons(status)
+            
+        # 如果是Mock设备完成，更新状态栏
+        if status == WorkerStatus.COMPLETED:
+            self.statusBar().showMessage(f"设备 {serial} 任务已完成", 3000)
     
     def _refresh_devices(self):
         """刷新设备列表"""
@@ -587,12 +610,36 @@ class MainWindow(QMainWindow):
             # 启动worker
             worker.start()
         
+        self.statusBar().showMessage(f"已启动 {mock_count} 个Mock设备", 5000)
+        
         QMessageBox.information(
             self, "Mock压测已启动",
             f"已启动 {mock_count} 个Mock设备并发运行。\n"
             f"每个设备将采集3个模拟店铺。\n"
-            f"结果将输出到 output/MOCK-XXX/results/"
+            f"你可以点击 '随机扰动' 按钮测试线程独立性。"
         )
+    
+    def _random_disturb_test(self):
+        """随机扰动测试：随机暂停/恢复一个Mock设备"""
+        import random
+        mock_workers = [w for s, w in self.workers.items() if s.startswith("MOCK-")]
+        if not mock_workers:
+            self.statusBar().showMessage("没有正在运行的Mock设备", 3000)
+            return
+            
+        worker = random.choice(mock_workers)
+        if worker.status == WorkerStatus.RUNNING:
+            worker.pause()
+            self.statusBar().showMessage(f"🎲 扰动：已暂停 {worker.device_serial}", 2000)
+        elif worker.status == WorkerStatus.PAUSED:
+            worker.resume()
+            self.statusBar().showMessage(f"🎲 扰动：已恢复 {worker.device_serial}", 2000)
+        else:
+            self.statusBar().showMessage(f"🎲 扰动：设备 {worker.device_serial} 状态为 {worker.status.value}", 2000)
+            
+        # 如果当前选中的正是这个设备，更新按钮
+        if worker.device_serial == self.current_device:
+            self._update_control_buttons(worker.status)
     
     def closeEvent(self, event):
         """关闭事件"""

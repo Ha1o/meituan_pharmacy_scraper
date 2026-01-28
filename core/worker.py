@@ -483,6 +483,13 @@ class DeviceWorker:
             
         except Exception as e:
             self.logger.exception(f"[Mock] 处理店铺[{task.shop_name}]", e)
+            # 即使异常也尝试导出已采集的数据
+            try:
+                filepath = self.exporter.export()
+                if filepath:
+                    self.logger.info(f"[Mock] 异常恢复: 已导出部分数据到 {filepath}")
+            except:
+                pass
             return False
     
     def _resume_to_shop(self, task: Task) -> bool:
