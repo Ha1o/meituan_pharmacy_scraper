@@ -1,0 +1,183 @@
+{
+    "app": {
+        "package_name": "com.sankuai.meituan",
+        "main_activity": "com.meituan.android.pt.homepage.activity.MainActivity",
+        "start_wait_seconds": 5
+    },
+    "timeouts": {
+        "default_timeout": 10,
+        "long_timeout": 20,
+        "short_timeout": 5
+    },
+    "scroll": {
+        "max_scroll_times": 30,
+        "scroll_duration": 0.5,
+        "scroll_pause": 1.0,
+        "no_new_data_threshold": 2
+    },
+    "retry": {
+        "max_retries": 3,
+        "retry_delay": 2
+    },
+    "selectors": {
+        "home_waimai": [
+            {
+                "text": "外卖"
+            },
+            {
+                "textContains": "外卖"
+            },
+            {
+                "description": "外卖"
+            }
+        ],
+        "waimai_pharmacy": [
+            {
+                "text": "看病买药"
+            },
+            {
+                "textContains": "看病买药"
+            },
+            {
+                "description": "看病买药"
+            }
+        ],
+        "location_search_btn": [
+            {
+                "resourceId": "com.sankuai.meituan:id/location_text"
+            },
+            {
+                "textContains": "定位"
+            },
+            {
+                "description": "当前位置"
+            }
+        ],
+        "location_search_input": [
+            {
+                "resourceId": "com.sankuai.meituan:id/search_input"
+            },
+            {
+                "className": "android.widget.EditText"
+            }
+        ],
+        "location_search_result": [
+            {
+                "resourceId": "com.sankuai.meituan:id/poi_name"
+            }
+        ],
+        "shop_search_btn": [
+            {
+                "resourceId": "com.sankuai.meituan:id/search_icon"
+            },
+            {
+                "textContains": "搜索"
+            },
+            {
+                "description": "搜索"
+            }
+        ],
+        "shop_search_input": [
+            {
+                "resourceId": "com.sankuai.meituan:id/search_edit"
+            },
+            {
+                "className": "android.widget.EditText"
+            }
+        ],
+        "shop_search_result": [
+            {
+                "resourceId": "com.sankuai.meituan:id/shop_name"
+            },
+            {
+                "className": "android.widget.LinearLayout",
+                "clickable": true
+            },
+            {
+                "className": "android.view.ViewGroup",
+                "clickable": true
+            }
+        ],
+        "all_products_tab": [
+            {
+                "text": "全部商品"
+            },
+            {
+                "textContains": "全部商品"
+            }
+        ],
+        "category_list": [
+            {
+                "resourceId": "com.sankuai.meituan:id/category_list"
+            },
+            {
+                "className": "android.widget.ListView"
+            },
+            {
+                "className": "androidx.recyclerview.widget.RecyclerView"
+            }
+        ],
+        "category_item": [
+            {
+                "className": "android.widget.TextView"
+            }
+        ],
+        "product_list": [
+            {
+                "resourceId": "com.sankuai.meituan:id/product_list"
+            },
+            {
+                "className": "androidx.recyclerview.widget.RecyclerView"
+            }
+        ],
+        "product_item": [
+            {
+                "className": "android.view.ViewGroup"
+            },
+            {
+                "className": "android.widget.LinearLayout"
+            }
+        ],
+        "product_name": [
+            {
+                "resourceId": "com.sankuai.meituan:id/product_name"
+            },
+            {
+                "className": "android.widget.TextView"
+            }
+        ],
+        "product_price": [
+            {
+                "resourceId": "com.sankuai.meituan:id/product_price"
+            },
+            {
+                "textMatches": "^¥?\\d+\\.?\\d*$"
+            },
+            {
+                "textContains": "¥"
+            }
+        ],
+        "product_sales": [
+            {
+                "resourceId": "com.sankuai.meituan:id/product_sales"
+            },
+            {
+                "textContains": "月销"
+            },
+            {
+                "textContains": "已售"
+            }
+        ],
+        "back_button": [
+            {
+                "resourceId": "com.sankuai.meituan:id/back"
+            },
+            {
+                "description": "返回"
+            },
+            {
+                "className": "android.widget.ImageButton"
+            }
+        ]
+    }
+}
