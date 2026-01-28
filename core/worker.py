@@ -920,13 +920,17 @@ class DeviceWorker:
                 # 采集当前可见的商品
                 new_count = self._collect_visible_products(current_category)
                 
+                # 动态阈值：如果是最后一个分类，使用更严格的判定标准（10次无数据）
+                # 否则使用配置的阈值（通常较小，用于快速检测风控）
+                current_threshold = 10 if is_last_category else no_new_threshold
+                
                 if new_count == 0:
                     no_new_count += 1
-                    if no_new_count >= no_new_threshold:
+                    if no_new_count >= current_threshold:
                         # 判断是否为风控触发
                         if not is_last_category:
                             # 非最后分类，判定为风控触发
-                            self.logger.warning(f"⚠️ 风控触发: 连续{no_new_threshold}次无新数据，当前分类: {current_category} (还有 {len(categories) - current_category_index - 1} 个分类未采集)")
+                            self.logger.warning(f"⚠️ 风控触发: 连续{no_new_count}次无新数据，当前分类: {current_category} (还有 {len(categories) - current_category_index - 1} 个分类未采集)")
                             self.logger.warning(f"请换号登录后，点击 '继续' 恢复采集")
                             
                             # 标记风控并保存状态
@@ -951,7 +955,7 @@ class DeviceWorker:
                             return True
                         else:
                             # 最后分类，正常结束
-                            self.logger.info(f"连续{no_new_threshold}次无新数据，已到达最后分类，采集完成")
+                            self.logger.info(f"连续{no_new_count}次无新数据，已到达最后分类，采集完成")
                             break
                 else:
                     no_new_count = 0
@@ -962,6 +966,9 @@ class DeviceWorker:
                 
                 time.sleep(scroll_pause)
             
+            if scroll_count >= max_scroll:
+                self.logger.warning(f"达到最大滚动次数({max_scroll})停止，可能未采集完所有商品")
+
             self.logger.info(f"采集完成: 滚动{scroll_count}次, 覆盖{len(collected_categories)}个分类")
             return True
             

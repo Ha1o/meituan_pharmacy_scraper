@@ -11,10 +11,10 @@
         "short_timeout": 5
     },
     "scroll": {
-        "max_scroll_times": 30,
+        "max_scroll_times": 10000,
         "scroll_duration": 0.5,
         "scroll_pause": 1.0,
-        "no_new_data_threshold": 2
+        "no_new_data_threshold": 3
     },
     "retry": {
         "max_retries": 3,
