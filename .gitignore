@@ -34,9 +34,7 @@ env/
 *~
 
 # Output files (logs, exports, state)
-output/logs/
-output/state/
-output/*.xlsx
+output/
 
 # UI dump files (debug)
 ui_dump.txt
