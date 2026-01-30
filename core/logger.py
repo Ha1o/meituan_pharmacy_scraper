@@ -132,7 +132,11 @@ class DeviceLogger:
         msg = f"【异常】{step_name} - {type(error).__name__}: {str(error)}"
         if screenshot_path:
             msg += f"\n    截图已保存: {screenshot_path}"
-        msg += "\n    请检查 config.json 中的选择器配置是否正确"
+        
+        # 仅在特定错误（如选择器查找失败）时提示检查配置，避免误导
+        if "Selector" in str(type(error).__name__) or "UiObject" in str(type(error).__name__):
+            msg += "\n    请检查 config.json 中的选择器配置是否正确"
+            
         self.error(msg)
     
     def get_logs(self) -> list[str]:

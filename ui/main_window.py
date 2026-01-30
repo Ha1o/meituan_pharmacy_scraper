@@ -29,16 +29,19 @@ class WorkerSignals(QObject):
 class MainWindow(QMainWindow):
     """主窗口"""
     
-    def __init__(self):
+    def __init__(self, app_root: str = None):
         super().__init__()
+        
+        # 应用根目录
+        self.app_root = app_root if app_root else os.getcwd()
         
         # 初始化管理器
         self.device_manager = DeviceManager()
         self.workers: Dict[str, DeviceWorker] = {}
         self.signals = WorkerSignals()
         
-        # 输出目录
-        self.output_dir = os.path.abspath("output")
+        # 输出目录 (在 exe 同级目录下创建 output)
+        self.output_dir = os.path.join(self.app_root, "output")
         os.makedirs(self.output_dir, exist_ok=True)
         
         # 当前选中的设备
@@ -124,8 +127,9 @@ class MainWindow(QMainWindow):
         # 加载配置判断是否显示调试功能
         enable_debug = False
         try:
-            if os.path.exists("config.json"):
-                with open("config.json", "r", encoding="utf-8") as f:
+            config_path = os.path.join(self.app_root, "config.json")
+            if os.path.exists(config_path):
+                with open(config_path, "r", encoding="utf-8") as f:
                     config = json.load(f)
                     enable_debug = config.get("enable_debug_features", False)
         except Exception as e:

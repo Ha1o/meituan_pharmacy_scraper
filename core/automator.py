@@ -342,7 +342,7 @@ class DeviceAutomator:
     def is_page_loaded(self, min_chinese_chars: int = 10) -> bool:
         """
         检测页面是否正常加载（非白屏）
-        通过统计可见文本元素的中文字符数来判断
+        通过统计页面XML中的中文字符数来判断
         
         Args:
             min_chinese_chars: 最少中文字符数，低于此值视为白屏
@@ -354,19 +354,14 @@ class DeviceAutomator:
             return False
         
         try:
-            # 获取所有可见的 TextView 元素的文本
-            text_views = self.device(className="android.widget.TextView")
+            # 使用 dump_hierarchy 一次性获取页面内容，避免遍历元素的多次 RPC 调用
+            xml_content = self.device.dump_hierarchy()
             
+            # 简单的字符串统计，比解析XML更快且足够有效
             chinese_count = 0
-            if text_views.exists(timeout=2):
-                for i in range(text_views.count):
-                    try:
-                        text = text_views[i].get_text()
-                        if text:
-                            # 统计这个元素中的中文字符
-                            chinese_count += sum(1 for char in text if '\u4e00' <= char <= '\u9fff')
-                    except:
-                        continue
+            for char in xml_content:
+                if '\u4e00' <= char <= '\u9fff':
+                    chinese_count += 1
             
             if chinese_count < min_chinese_chars:
                 self.logger.warning(f"检测到白屏/加载不全: 中文字符数={chinese_count} (阈值={min_chinese_chars})")
@@ -424,16 +419,19 @@ class DeviceAutomator:
             return False
             
         try:
+            # 使用 dump_hierarchy 快速检查页面内容
+            xml_content = self.device.dump_hierarchy()
+            
             # 检测"重新加载"按钮
-            reload_btn = self.device(text="重新加载")
-            if reload_btn.exists(timeout=2):
+            if "重新加载" in xml_content:
                 self.logger.warning("检测到错误页面，点击'重新加载'")
-                reload_btn.click()
+                # 这里仍需使用 UI 查找来点击，但只有在确认存在时才调用
+                self.device(text="重新加载").click()
                 time.sleep(3)
                 return True
                 
             # 检测"网络悄悄跑到外星球去了"
-            if self.device(textContains="外星球").exists(timeout=1):
+            if "外星球" in xml_content:
                 self.logger.warning("检测到网络错误页面，尝试点击屏幕中心重试")
                 width, height = self.get_screen_size()
                 self.device.click(width // 2, height // 2)
@@ -445,3 +443,73 @@ class DeviceAutomator:
             self.logger.debug(f"检查错误页面失败: {e}")
             return False
 
+
+    def parse_hierarchy(self, xml_content: str) -> list:
+        """
+        解析XML层级数据为结构化列表
+        
+        Args:
+            xml_content: XML字符串
+            
+        Returns:
+            包含节点信息的字典列表: [{'text': str, 'bounds': dict, 'resourceId': str, 'className': str}, ...]
+        """
+        if not xml_content:
+            return []
+            
+        try:
+            import xml.etree.ElementTree as ET
+            import re
+            
+            # 处理可能的编码问题
+            if isinstance(xml_content, bytes):
+                xml_content = xml_content.decode('utf-8', errors='ignore')
+                
+            root = ET.fromstring(xml_content)
+            nodes = []
+            
+            # 递归遍历
+            def traverse(node):
+                # 获取属性
+                text = node.get('text', '')
+                resource_id = node.get('resource-id', '')
+                class_name = node.get('class', '')
+                bounds_str = node.get('bounds', '')
+                content_desc = node.get('content-desc', '')
+                
+                # 解析坐标 [0,0][1080,1920]
+                bounds = None
+                if bounds_str:
+                    match = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', bounds_str)
+                    if match:
+                        left, top, right, bottom = map(int, match.groups())
+                        bounds = {
+                            'left': left,
+                            'top': top,
+                            'right': right,
+                            'bottom': bottom,
+                            'width': right - left,
+                            'height': bottom - top,
+                            'center_x': (left + right) // 2,
+                            'center_y': (top + bottom) // 2
+                        }
+                
+                # 只有包含有用信息的节点才保留
+                if text or content_desc or resource_id or bounds:
+                    nodes.append({
+                        'text': text,
+                        'content_desc': content_desc,
+                        'resourceId': resource_id,
+                        'className': class_name,
+                        'bounds': bounds
+                    })
+                
+                for child in node:
+                    traverse(child)
+            
+            traverse(root)
+            return nodes
+            
+        except Exception as e:
+            self.logger.warning(f"解析XML失败: {e}")
+            return []
