@@ -189,14 +189,13 @@ class ExcelExporter:
                 cell.alignment = header_alignment
             
             # 写入数据
-            # 按模板格式：定位ID、定位点、店铺名字只在第一行显示
+            # 按需求模板：每一行都要填充定位ID、定位点、店铺名字
             for row_num, record in enumerate(self.records, 2):
-                # 前三列只在第一行写入
-                if row_num == 2:
-                    ws.cell(row=row_num, column=1, value=self.current_task_id)
-                    ws.cell(row=row_num, column=2, value=self.current_poi)
-                    ws.cell(row=row_num, column=3, value=shop_name)
-                
+                # 每一行都写入前三列
+                ws.cell(row=row_num, column=1, value=self.current_task_id)
+                ws.cell(row=row_num, column=2, value=self.current_poi)
+                ws.cell(row=row_num, column=3, value=shop_name)
+
                 # 商品数据从第4列开始
                 data = record.to_list()  # [分类, 商品名, 月销, 价格]
                 for col, value in enumerate(data, 4):
@@ -254,12 +253,15 @@ def create_drug_record(
         DrugRecord对象
     """
     # 清理月销数据
+    # 强制格式：月售 + 数字
     if not monthly_sales or monthly_sales.strip() == "":
-        monthly_sales = "0"
+        num = "0"
     else:
         # 提取数字
         sales_match = re.search(r'(\d+)', monthly_sales)
-        monthly_sales = sales_match.group(1) if sales_match else "0"
+        num = sales_match.group(1) if sales_match else "0"
+
+    monthly_sales = f"月售{num}"
     
     # 清理价格数据
     if price:

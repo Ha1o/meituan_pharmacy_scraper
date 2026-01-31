@@ -904,39 +904,126 @@ class DeviceWorker:
             is_last_category = (current_category_index == len(categories) - 1)
             
             self.logger.info(f"开始连续滚动采集，当前分类: {current_category} (最后分类: {is_last_category})")
-            
+
+            # === 边界模式状态机 ===
+            # 检查是否启用边界模式
+            enable_boundary_mode = self.config.get("features", {}).get("enable_boundary_mode", True)
+            verify_threshold = self.config.get("features", {}).get("verify_screen_threshold", 10)
+
+            # 状态变量
+            switch_mode = "NORMAL"
+            next_category = ""
+            divider_y = 0
+            verify_screen_count = 0
+
             while scroll_count < max_scroll:
                 if not self._check_control():
                     return False
-                
+
                 # === 优化核心：一次获取，本地解析 ===
-                # 获取当前页面XML并解析为节点列表
                 xml_content = self.automator.get_page_source()
                 ui_nodes = self.automator.parse_hierarchy(xml_content)
-                
-                # 检测分类标题（看是否进入了新分类）
-                detected_category = self._detect_category_header(category_set, ui_nodes)
-                if detected_category and detected_category != current_category:
-                    self.logger.info(f"检测到分类切换: {current_category} → {detected_category}")
-                    current_category = detected_category
-                    self.current_category = current_category
-                    self.state_store.current_category_name = current_category
-                    
-                    # 更新分类索引
-                    if current_category in categories:
-                        current_category_index = categories.index(current_category)
+
+                # === 边界检测（方案1）===
+                # 每次滚动后检测是否出现分类边界
+                has_boundary, next_category_candidate, boundary_y = self._detect_category_boundary(
+                    ui_nodes, current_category, categories
+                )
+
+                # 如果检测到边界，触发异步修正逻辑（用户强制要求）
+                if has_boundary and next_category_candidate:
+                    # 1. 找到分界线之上的最后一个商品（锚点）
+                    anchor_product_name = self._find_last_product_above_boundary(ui_nodes, boundary_y)
+
+                    if anchor_product_name:
+                        self.logger.info(f"【锚点定位】分类 {current_category} 的最后一个商品是: {anchor_product_name}")
+
+                        # 2. 启动异步线程，5秒后执行修正
+                        # 注意：需要传递当前的记录列表快照或索引，但由于是引用传递，直接传 next_category 即可
+                        # 修正逻辑：在 records 中找到 anchor_product_name，将其后的所有商品重置为 next_category_candidate
+
+                        def async_correction_task(worker_ref, anchor_name, target_category, log_category_from):
+                            try:
+                                time.sleep(5)  # 等待5秒
+                                worker_ref.logger.info(f"【异步修正启动】开始执行分类修正: {log_category_from} -> {target_category}")
+
+                                # 锁定记录列表（虽然GIL保证了列表操作原子性，但为了逻辑安全）
+                                # 在 worker 实例中执行修正
+                                count = worker_ref._perform_retroactive_correction(anchor_name, log_category_from, target_category)
+
+                                if count > 0:
+                                    worker_ref.logger.info(f"【异步修正完成】已将锚点 '{anchor_name}' 之后的 {count} 个商品归属修正为 {target_category}")
+                                else:
+                                    worker_ref.logger.info(f"【异步修正跳过】未找到需要修正的商品 (锚点: {anchor_name})")
+
+                            except Exception as e:
+                                worker_ref.logger.error(f"【异步修正异常】{e}")
+
+                        # 启动守护线程
+                        t = threading.Thread(
+                            target=async_correction_task,
+                            args=(self, anchor_product_name, next_category_candidate, current_category),
+                            daemon=True
+                        )
+                        t.start()
+                    else:
+                        self.logger.warning(f"检测到边界但未找到上方锚点商品 (Y={boundary_y})")
+
+                # 如果检测到边界，进入边界模式
+                if has_boundary and next_category_candidate:
+                    self.logger.info(f"🔄 进入边界模式: {current_category} → {next_category} (分界线Y={boundary_y})")
+
+                    # === 边界模式采集逻辑优化 ===
+                    # 无论左侧是否切换，屏幕上此刻都同时存在两个分类的商品（因为检测到了边界）
+                    # 必须采集当前屏幕数据，通过 boundary_y 进行区分
+
+                    self.logger.info(f"边界模式采集: {current_category} (上) vs {next_category} (下)")
+                    curr_new, next_new = self._collect_visible_products_with_boundary(
+                        current_category, ui_nodes, "BOUNDARY", boundary_y, next_category
+                    )
+                    new_count = curr_new + next_new
+
+                    # 重新获取UI状态，检测左侧是否已切换
+                    xml_content_check = self.automator.get_page_source()
+                    ui_nodes_check = self.automator.parse_hierarchy(xml_content_check)
+                    detected_category = self._detect_selected_category_from_nodes(ui_nodes_check)
+
+                    if detected_category == next_category:
+                        # 左侧已切换
+                        self.logger.info(f"✅ 左侧已切换完成: {current_category} → {next_category}")
+                        current_category = next_category
+                        current_category_index += 1
+                        self.current_category = current_category
+                        self.state_store.current_category_name = current_category
                         self.state_store.current_category_index = current_category_index
+                        collected_categories.add(current_category)
+                        self._update_progress()
+                        self.state_store.save()
+                        no_new_count = 0
                         is_last_category = (current_category_index == len(categories) - 1)
-                    
-                    collected_categories.add(current_category)
-                    self._update_progress()
-                    no_new_count = 0  # 重置计数器
-                    
-                    # 分类切换时保存进度
-                    self.state_store.save()
-                
-                # 采集当前可见的商品
-                new_count = self._collect_visible_products(current_category, ui_nodes)
+                    else:
+                        # 左侧还未切换，但我们已经采集了边界数据
+                        # 如果下一分类的数据量显著（next_new > 0），我们也可以认为进入了下一分类
+                        if next_new > 0:
+                             self.logger.info(f"⚠️ 左侧未切换，但已采集到下一分类商品，准备切换: {current_category} → {next_category}")
+
+                        # 再次检测左侧是否已切换 (原有逻辑)
+                        detected_category_after = self._detect_selected_category_from_nodes(ui_nodes_check)
+                        if detected_category_after == next_category:
+                            self.logger.info(f"✅ 左侧分类已切换: {current_category} → {next_category}")
+                            current_category = next_category
+                            current_category_index += 1
+                            self.current_category = current_category
+                            self.state_store.current_category_name = current_category
+                            self.state_store.current_category_index = current_category_index
+                            collected_categories.add(current_category)
+                            self._update_progress()
+                            self.state_store.save()
+                            no_new_count = 0
+                            is_last_category = (current_category_index == len(categories) - 1)
+                else:
+                    # 正常模式：使用当前分类采集
+                    new_count = self._collect_visible_products(current_category, ui_nodes)
                 
                 # 动态阈值：如果是最后一个分类，使用更严格的判定标准（10次无数据）
                 # 否则使用配置的阈值（通常较小，用于快速检测风控）
@@ -1045,8 +1132,8 @@ class DeviceWorker:
             
             # 1. 初始化状态
             # 优先尝试识别左侧选中的分类
-            current_category = self._detect_left_selected_category()
-            
+            current_category = self._detect_current_selected_category()
+
             if not current_category:
                 # 尝试从屏幕识别当前分类标题
                 current_category = self._detect_category_header_seamless()
@@ -1074,41 +1161,327 @@ class DeviceWorker:
                 collected_categories.add(current_category)
             
             manual_stop = False
-            
-            # 3. 循环采集
+
+            # ========================================
+            # 🔍 静态分析模式 - 已禁用
+            # ========================================
+            STATIC_ANALYSIS_MODE = False
+
+            if STATIC_ANALYSIS_MODE:
+                self.logger.info("="*80)
+                self.logger.info("🔍 静态分析模式 - 商品归属分析")
+                self.logger.info("方案1: 查找分类边界（分割线、分类标题）")
+                self.logger.info("方案2: 分析商品卡片控件（查找内部分类信息）")
+                self.logger.info("="*80)
+
+                # 获取当前屏幕XML
+                xml_content = self.automator.get_page_source()
+                ui_nodes = self.automator.parse_hierarchy(xml_content)
+
+                # 获取屏幕尺寸
+                screen_info = self.automator.device.info
+                w = screen_info.get("displayWidth", 1096)
+                h = screen_info.get("displayHeight", 2560)
+
+                # ==========================================
+                # 方案1: 查找分类边界元素
+                # ==========================================
+                self.logger.info("")
+                self.logger.info("="*80)
+                self.logger.info("【方案1】扫描分类边界元素")
+                self.logger.info("="*80)
+
+                # 1.1 查找所有分类标题（右侧商品区域）
+                category_titles = []
+                for node in ui_nodes:
+                    text = node.get('text', '').strip()
+                    if not text or len(text) < 2:
+                        continue
+
+                    bounds = node.get('bounds')
+                    if not bounds:
+                        continue
+
+                    cx = bounds['center_x']
+                    cy = bounds['center_y']
+
+                    # 只看右侧商品区域（X > 20%）
+                    # Y在商品区域（15%-85%）
+                    if cx > w * 0.20 and w * 0.15 < cy < w * 0.85:
+                        # 检查是否是分类标题
+                        # 分类标题特征：2-6个字，不含价格符号等
+                        if len(text) <= 6 and '¥' not in text and '月售' not in text:
+                            category_titles.append({
+                                'text': text,
+                                'y': cy,
+                                'bounds': bounds,
+                                'className': node.get('className', '')
+                            })
+
+                self.logger.info(f"\n找到 {len(category_titles)} 个可能的分类标题:")
+                for i, title in enumerate(category_titles[:20]):  # 只显示前20个
+                    self.logger.info(f"  {i+1}. [{title['text']}] Y={title['y']}, className={title['className']}")
+
+                # 1.2 查找所有分割线
+                dividers = []
+                for node in ui_nodes:
+                    bounds = node.get('bounds')
+                    if not bounds:
+                        continue
+
+                    # 分割线特征：
+                    # 1. 高度很小（<= 5px）
+                    # 2. 宽度很大（>= 50%屏宽）
+                    # 3. 在商品区域（X > 20%）
+                    if (bounds['height'] <= 5 and
+                        bounds['width'] >= w * 0.50 and
+                        bounds['left'] > w * 0.20):
+
+                        dividers.append({
+                            'y': bounds['center_y'],
+                            'bounds': bounds,
+                            'className': node.get('className', ''),
+                            'resourceId': node.get('resourceId', '')
+                        })
+
+                self.logger.info(f"\n找到 {len(dividers)} 条可能的分割线:")
+                for i, div in enumerate(dividers[:20]):
+                    self.logger.info(f"  {i+1}. Y={div['y']}, width={div['bounds']['width']}, height={div['bounds']['height']}, className={div['className']}")
+
+                # ==========================================
+                # 方案2: 分析商品卡片控件
+                # ==========================================
+                self.logger.info("")
+                self.logger.info("="*80)
+                self.logger.info("【方案2】分析商品卡片控件结构")
+                self.logger.info("="*80)
+
+                import re
+                import xml.etree.ElementTree as ET
+
+                root = ET.fromstring(xml_content)
+
+                # 2.1 查找所有价格元素（作为商品卡片的锚点）
+                def find_all_prices(element, parent_chain=[]):
+                    """递归查找所有价格元素及其父链"""
+                    prices = []
+                    text = element.attrib.get('text', '')
+
+                    # 识别价格
+                    if re.match(r"^¥?\d+\.?\d*$", text):
+                        price_text = text.replace('¥', '').replace('￥', '')
+                        bounds_str = element.attrib.get('bounds', '')
+
+                        if bounds_str:
+                            # 解析bounds
+                            match = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', bounds_str)
+                            if match:
+                                left, top, right, bottom = map(int, match.groups())
+                                center_y = (top + bottom) // 2
+                                center_x = (left + right) // 2
+
+                                # 只看商品区域
+                                if (center_x > w * 0.20 and center_x < w * 0.95 and
+                                    center_y > h * 0.15 and center_y < h * 0.90):
+
+                                    prices.append({
+                                        'price': price_text,
+                                        'y': center_y,
+                                        'x': center_x,
+                                        'element': element,
+                                        'parent_chain': parent_chain.copy()
+                                    })
+
+                    # 递归查找
+                    new_chain = parent_chain + [element]
+                    for child in element:
+                        prices.extend(find_all_prices(child, new_chain))
+
+                    return prices
+
+                all_prices = find_all_prices(root)
+                self.logger.info(f"\n找到 {len(all_prices)} 个商品价格（商品卡片）")
+
+                # 2.2 对每个商品卡片，分析其父节点链和所有兄弟节点
+                for i, price_info in enumerate(all_prices[:10]):  # 只分析前10个商品
+                    self.logger.info("")
+                    self.logger.info("="*60)
+                    self.logger.info(f"商品 {i+1}: 价格=¥{price_info['price']}, Y={price_info['y']}")
+                    self.logger.info("="*60)
+
+                    parent_chain = price_info['parent_chain']
+
+                    # 分析父节点链（只显示前5层）
+                    self.logger.info("\n[父节点链] (从近到远):")
+                    for depth, parent in enumerate(reversed(parent_chain[:5])):
+                        class_name = parent.attrib.get('class', '')
+                        resource_id = parent.attrib.get('resource-id', '')
+                        bounds = parent.attrib.get('bounds', '')
+
+                        self.logger.info(f"\n  父{depth+1}:")
+                        self.logger.info(f"    class = {class_name}")
+                        self.logger.info(f"    resource-id = {resource_id}")
+                        self.logger.info(f"    bounds = {bounds}")
+
+                        # 查找父节点的所有子节点中是否有分类信息
+                        if depth == 0:  # 直接父节点
+                            self.logger.info(f"\n  [父1的所有子节点]:")
+                            child_count = 0
+                            for sibling in parent:
+                                sibling_text = sibling.attrib.get('text', '').strip()
+                                sibling_class = sibling.attrib.get('class', '')
+                                sibling_id = sibling.attrib.get('resource-id', '')
+
+                                if sibling_text or 'category' in sibling_id.lower() or 'tag' in sibling_id.lower():
+                                    child_count += 1
+                                    self.logger.info(f"    子节点{child_count}:")
+                                    self.logger.info(f"      text = '{sibling_text}'")
+                                    self.logger.info(f"      class = {sibling_class}")
+                                    self.logger.info(f"      resource-id = {sibling_id}")
+
+                                    # 特别标记可能是分类信息的节点
+                                    if ('category' in sibling_id.lower() or
+                                        'tag' in sibling_id.lower() or
+                                        (len(sibling_text) >= 2 and len(sibling_text) <= 6 and '¥' not in sibling_text)):
+                                        self.logger.info(f"      ⭐ 可能是分类信息！")
+
+                self.logger.info("")
+                self.logger.info("="*80)
+                self.logger.info("静态分析完成")
+                self.logger.info("请查看日志，对比方案1和方案2的结果")
+                self.logger.info("="*80)
+
+                return True
+
+            # 3. 循环采集（正常模式）
+                self.logger.info("="*80)
+                self.logger.info("🔍 静态分析模式已启用")
+                self.logger.info("仅分析当前屏幕，不进行滚动采集")
+                self.logger.info("用于对比选中/未选中分类的控件差异")
+                self.logger.info("="*80)
+
+                # 只执行一次分析
+                xml_content = self.automator.get_page_source()
+                ui_nodes = self.automator.parse_hierarchy(xml_content)
+
+                # 检测当前选中的分类
+                detected_category = self._detect_selected_category_from_nodes(ui_nodes)
+
+                if detected_category:
+                    self.logger.info(f"✅ 检测到选中分类: {detected_category}")
+                else:
+                    self.logger.warning("⚠️ 未检测到选中分类")
+
+                # 静态分析完成，直接返回
+                self.logger.info("")
+                self.logger.info("静态分析完成，程序即将退出")
+                self.logger.info("请查看日志中的 [同级兄弟节点] 部分，对比差异")
+                return True
+
+            # 3. 循环采集（正常模式）
             while scroll_count < max_scroll:
                 if not self._check_control():
                     self.logger.info("检测到停止信号，正在保存数据...")
                     manual_stop = True
                     break
-                
+
                 # === 优化核心：一次获取，本地解析 ===
                 xml_content = self.automator.get_page_source()
                 ui_nodes = self.automator.parse_hierarchy(xml_content)
-                
-                # A. 检测新分类
-                detected_category = self._detect_category_header_seamless(ui_nodes)
-                if detected_category and detected_category != current_category:
-                    self.logger.info(f"滚动中发现新分类: {current_category} → {detected_category}")
-                    current_category = detected_category
-                    self.current_category = current_category
-                    self.state_store.current_category_name = current_category
-                    
-                    collected_categories.add(current_category)
-                    self._update_progress()
-                    no_new_count = 0 # 切换分类重置计数
-                
-                # B. 采集商品
-                new_count = self._collect_visible_products(current_category, ui_nodes)
-                
+
+                # 获取已知分类列表
+                categories = list(self.state_store.state.get("categories", []))
+                if not categories:
+                    categories = self._get_category_list(scroll_rounds=0)
+                    if categories:
+                        self.state_store.state["categories"] = categories
+
+                # === 严格边界检测 ===
+                # 每次滚动后，优先检测是否存在分类边界（分割线/新标题）
+                has_boundary, next_cat_candidate, boundary_y = self._detect_category_boundary(
+                    ui_nodes, current_category, categories
+                )
+
+                if has_boundary:
+                    # 即使没有识别出下一分类名，只要有边界线，就尝试从分类列表推断
+                    if not next_cat_candidate and current_category in categories:
+                        idx = categories.index(current_category)
+                        if idx + 1 < len(categories):
+                            next_cat_candidate = categories[idx + 1]
+
+                    next_cat_display = next_cat_candidate if next_cat_candidate else "未知分类"
+                    self.logger.info(f"🛑 [严格边界控制] 检测到分界线 Y={boundary_y} | 上方: {current_category} | 下方: {next_cat_display}")
+
+                    # === 核心逻辑：回溯修正 (Retroactive Correction) ===
+                    # 1. 立即查找分界线上方最后一个商品（锚点）
+                    anchor_product = self._find_last_product_above_boundary(ui_nodes, boundary_y)
+
+                    if anchor_product and next_cat_candidate:
+                        self.logger.info(f"⚓ 锚点商品(分界线上方): [{anchor_product}]")
+                        # 2. 执行回溯修正：在已采集记录中查找该锚点，并将之后的所有商品归类为下一分类
+                        self._perform_retroactive_correction(anchor_product, current_category, next_cat_candidate)
+                    else:
+                        self.logger.debug(f"未能确定锚点或下一分类，跳过回溯修正 (Anchor={anchor_product}, Next={next_cat_candidate})")
+
+                    # 边界模式采集：严格按照 Y 坐标切分
+                    curr_new, next_new = self._collect_visible_products_with_boundary(
+                        current_category, ui_nodes, "BOUNDARY", boundary_y, next_cat_candidate
+                    )
+                    new_count = curr_new + next_new
+
+                    # 如果采集到了下方分类的数据，说明已经实质性进入了下一个分类
+                    if next_cat_candidate and next_new > 0:
+                        self.logger.info(f"✅ [严格边界] 采集到下方新分类数据 ({next_new}条)，执行分类切换")
+                        # 立即切换分类
+                        current_category = next_cat_candidate
+                        self.current_category = current_category
+                        self.state_store.current_category_name = current_category
+                        collected_categories.add(current_category)
+                        self._update_progress()
+                        self.state_store.save()
+                        no_new_count = 0
+                    else:
+                        self.logger.info(f"ℹ️ [严格边界] 仅采集到上方分类数据，暂不切换分类")
+                        no_new_count = 0
+
+                else:
+                    # 无边界模式：常规采集
+                    # 仍然检测左侧导航栏，以防万一
+                    detected_category = self._detect_selected_category_from_nodes(ui_nodes)
+
+                    # 双重检查：如果左侧没变，尝试从右侧商品区找已知分类标题（作为兜底）
+                    if not detected_category:
+                        known_categories = set(categories)
+                        if known_categories:
+                            detected_category = self._detect_category_from_known_list(ui_nodes, known_categories)
+
+                    if detected_category and detected_category != current_category:
+                        self.logger.info(f"✅ [常规模式] 检测到分类切换: {current_category} → {detected_category}")
+                        current_category = detected_category
+                        self.current_category = current_category
+                        self.state_store.current_category_name = current_category
+                        collected_categories.add(current_category)
+                        self._update_progress()
+                        no_new_count = 0
+
+                    # 采集
+                    new_count = self._collect_visible_products(current_category, ui_nodes)
+
                 if new_count == 0:
                     no_new_count += 1
-                    if no_new_count >= no_new_threshold:
-                        self.logger.info(f"连续 {no_new_count} 次无新数据，且无新分类出现，停止采集")
-                        break
+                    # 动态阈值：如果是最后一个分类，使用更严格的判定标准
+                    is_last = (categories and current_category == categories[-1])
+                    current_threshold = 10 if is_last else no_new_threshold
+
+                    if no_new_count >= current_threshold:
+                        if not is_last:
+                            self.logger.warning(f"⚠️ 风控/卡死预警: 连续{no_new_count}次无数据，当前: {current_category}")
+                        else:
+                            self.logger.info(f"连续 {no_new_count} 次无新数据，已到达最后分类，停止采集")
+                            break
                 else:
                     no_new_count = 0
-                
+
                 # C. 滚动
                 self.automator.swipe_up()
                 scroll_count += 1
@@ -1137,53 +1510,155 @@ class DeviceWorker:
                 pass
             return False
 
-    def _detect_left_selected_category(self) -> str:
+    def _detect_category_from_known_list(self, ui_nodes: list, known_categories: set) -> str:
         """
-        检测左侧侧边栏当前选中的分类
-        依赖 selected=True 或 checked=True 属性
+        从已知分类列表中匹配商品区的文本
+        只匹配真正的分类名（如"儿童用药"、"肿瘤用药"），排除筛选标签（如"肿瘤辅助药"）
+
+        Args:
+            ui_nodes: UI节点列表
+            known_categories: 已知的分类名称集合
+
+        Returns:
+            检测到的分类名，未检测到则返回空字符串
         """
         try:
             # 获取屏幕尺寸
             screen_info = self.automator.device.info
             w = screen_info.get("displayWidth", 1096)
-            
-            # 限制在左侧 25% 区域
-            max_x = w * 0.25
-            
-            # 查找所有 selected=True 或 checked=True 的 TextView
-            elements = self.automator.device(className="android.widget.TextView")
-            
-            if elements.exists(timeout=0.5):
-                for i in range(elements.count):
-                    try:
-                        elem = elements[i]
-                        # 检查位置
-                        bounds = elem.info.get('bounds')
-                        if not bounds: continue
-                        
-                        center_x = (bounds['left'] + bounds['right']) // 2
-                        if center_x < max_x:
-                            text = elem.get_text()
-                            if text:
-                                text = text.strip()
-                                # 排除干扰项
-                                if text in ["推荐", "活动", "品牌", "常用清单", "全部商品"]: continue
-                                if len(text) < 2: continue
-                                
-                                # 获取状态
-                                is_selected = elem.info.get('selected', False)
-                                is_checked = elem.info.get('checked', False)
-                                
-                                if is_selected or is_checked:
-                                    self.logger.info(f"识别到左侧选中分类: {text}")
-                                    return text
-                    except:
-                        continue
-            
+            h = screen_info.get("displayHeight", 2560)
+
+            # 在商品区域查找已知分类名
+            # X: 商品区域（排除左侧导航栏）
+            min_x = w * 0.20
+            max_x = w * 0.80
+            # Y: 屏幕中上部
+            min_y = h * 0.12
+            max_y = h * 0.60
+
+            candidates = []
+
+            for node in ui_nodes:
+                text = node.get('text', '').strip()
+                if not text:
+                    continue
+
+                # 关键：只匹配已知分类名
+                if text not in known_categories:
+                    continue
+
+                bounds = node.get('bounds')
+                if not bounds:
+                    continue
+
+                cx = bounds['center_x']
+                cy = bounds['center_y']
+
+                # 位置过滤
+                if min_x < cx < max_x and min_y < cy < max_y:
+                    candidates.append((text, cy))
+
+            if candidates:
+                # 按Y坐标排序，取最上面的一个
+                candidates.sort(key=lambda x: x[1])
+                detected = candidates[0][0]
+                self.logger.info(f"从已知分类列表匹配到: {detected} (y={candidates[0][1]})")
+                return detected
+
             return ""
         except Exception as e:
-            self.logger.debug(f"左侧分类检测失败: {e}")
+            self.logger.debug(f"已知分类匹配失败: {e}")
             return ""
+
+    def _detect_selected_category_from_nodes(self, ui_nodes: list) -> str:
+        """
+        从UI节点中检测左侧导航栏当前选中的分类
+
+        策略：仅通过XML层级结构查找橙色竖条indicator
+        橙色竖条位置：父3 (FrameLayout) 的子节点
+        resourceId: category_item_indicator_left
+        """
+        try:
+            # 使用device.dump_hierarchy()获取完整XML并解析父子关系
+            import xml.etree.ElementTree as ET
+
+            xml_content = self.automator.device.dump_hierarchy()
+            root = ET.fromstring(xml_content)
+
+            # 查找所有 resourceId=txt_category_name_1 的分类TextView
+            category_nodes = []
+
+            def find_category_nodes(element, parent_chain=[]):
+                """递归查找所有分类节点并记录父链"""
+                resource_id = element.attrib.get('resource-id', '')
+
+                # 找到分类节点
+                if 'txt_category_name_1' in resource_id:
+                    text = element.attrib.get('text', '').strip()
+                    if text and len(text) >= 2:
+                        # 排除干扰项
+                        if text not in ["推荐", "活动", "品牌", "常用清单", "全部商品", "首页", "商家", "全部", "综合", "销量", "价格"]:
+                            category_nodes.append({
+                                'text': text,
+                                'element': element,
+                                'parent_chain': parent_chain.copy()
+                            })
+
+                # 递归查找子节点
+                new_chain = parent_chain + [element]
+                for child in element:
+                    find_category_nodes(child, new_chain)
+
+            find_category_nodes(root)
+
+            # 遍历所有分类，检查父3层级是否有橙色竖条
+            for cat_info in category_nodes:
+                text = cat_info['text']
+                parent_chain = cat_info['parent_chain']
+
+                # 获取父3（FrameLayout）
+                if len(parent_chain) >= 3:
+                    parent3 = parent_chain[-3]  # 倒数第3个是父3
+
+                    # 检查父3的所有子节点，查找橙色竖条
+                    for sibling in parent3:
+                        sibling_id = sibling.attrib.get('resource-id', '')
+                        if 'category_item_indicator' in sibling_id:
+                            # 找到橙色竖条，说明这个分类是选中的
+                            self.logger.info(f"✅ 检测到选中分类: {text}")
+                            return text
+
+            # 兼容性检测：如果没有找到橙色竖条，检查 selected="true" 属性
+            # 但仅限左侧分类区域
+            screen_info = self.automator.device.info
+            w = screen_info.get("displayWidth", 1096)
+
+            for node in ui_nodes:
+                if node.get('selected') == 'true':
+                    # 检查是否在左侧区域
+                    bounds = node.get('bounds')
+                    if bounds and bounds['center_x'] < w * 0.25:
+                        text = node.get('text', '').strip()
+                        if text and len(text) >= 2 and text not in ["推荐", "活动", "品牌"]:
+                            self.logger.info(f"✅ 检测到选中分类(selected属性): {text}")
+                            return text
+
+            return ""
+
+        except Exception as e:
+            self.logger.error(f"分类检测失败: {e}")
+            return ""
+
+    def _detect_selected_by_orange_bar(self, ui_nodes: list) -> str:
+        """已弃用：不再使用不准确的坐标推断"""
+        return ""
+
+    def _detect_current_selected_category(self) -> str:
+        """
+        检测左侧导航栏当前选中的分类
+        仅使用XML结构检测，不再进行位置推断
+        """
+        return self._detect_selected_category_from_nodes(self.automator.parse_hierarchy(self.automator.device.dump_hierarchy()))
 
     def _detect_category_header_seamless(self, ui_nodes: list = None) -> str:
         """
@@ -1256,7 +1731,152 @@ class DeviceWorker:
         except:
             return ""
 
-    def _detect_category_header(self, known_categories: set, ui_nodes: list = None) -> str:
+    def _detect_next_category_from_sidebar(self, ui_nodes: list) -> str:
+        """
+        [New] 从侧边栏动态检测下一个分类
+        策略：
+        1. 找到橙色指示条(category_item_indicator)确定当前分类位置
+        2. 在侧边栏列表中找到位于当前分类下方的第一个有效分类名
+        """
+        try:
+            screen_info = self.automator.device.info
+            w = screen_info.get("displayWidth", 1096)
+            sidebar_max_x = w * 0.25
+
+            # 1. 寻找橙色指示条的位置
+            indicator_y = -1
+            for node in ui_nodes:
+                rid = node.get('resourceId', '')
+                if 'category_item_indicator' in rid:
+                    bounds = node.get('bounds')
+                    if bounds:
+                        indicator_y = bounds['center_y']
+                        break
+
+            # 2. 收集所有侧边栏分类项
+            sidebar_items = []
+            for node in ui_nodes:
+                text = node.get('text', '').strip()
+                bounds = node.get('bounds')
+
+                if not text or not bounds:
+                    continue
+
+                # 必须在侧边栏区域 (收紧范围至20%，排除右侧筛选栏)
+                if bounds['center_x'] > w * 0.20:
+                    continue
+
+                # 排除无效文本
+                if len(text) < 2 or text in ["推荐", "活动", "品牌", "常用清单", "全部商品", "首页", "商家", "综合", "销量", "价格", "优惠", "筛选", "排序"]:
+                    continue
+
+                # 排除价格数字
+                if "¥" in text or text.replace('.', '').isdigit():
+                    continue
+
+                sidebar_items.append({
+                    'text': text,
+                    'y': bounds['center_y'],
+                    'selected': node.get('selected') == 'true'
+                })
+
+            # 按 Y 坐标排序
+            sidebar_items.sort(key=lambda x: x['y'])
+
+            # 3. 确定当前分类索引
+            current_index = -1
+
+            # 优先使用指示条匹配
+            if indicator_y != -1:
+                min_dist = 9999
+                for i, item in enumerate(sidebar_items):
+                    dist = abs(item['y'] - indicator_y)
+                    if dist < min_dist:
+                        min_dist = dist
+                        current_index = i
+
+                # 如果距离太远（超过150px），可能匹配错误
+                if min_dist > 150:
+                    current_index = -1
+
+            # 降级：使用 selected 属性匹配
+            if current_index == -1:
+                for i, item in enumerate(sidebar_items):
+                    if item['selected']:
+                        current_index = i
+                        break
+
+            # 4. 返回下一个分类
+            if current_index != -1 and current_index + 1 < len(sidebar_items):
+                next_item = sidebar_items[current_index + 1]
+                self.logger.debug(f"侧边栏动态检测: 当前='{sidebar_items[current_index]['text']}' -> 下一个='{next_item['text']}'")
+                return next_item['text']
+
+            return ""
+
+        except Exception as e:
+            self.logger.debug(f"侧边栏检测失败: {e}")
+            return ""
+
+    def _detect_category_boundary(self, ui_nodes: list, current_category: str, all_categories: list) -> tuple:
+        """
+        检测分类边界（分割线和下一分类标题）
+
+        修改后逻辑：
+        1. 必须存在分割线
+        2. 下一分类优先通过侧边栏动态检测 (Strict Single Mode)
+        """
+        try:
+            screen_info = self.automator.device.info
+            w = screen_info.get("displayWidth", 1096)
+            h = screen_info.get("displayHeight", 2560)
+
+            # 1. 查找分割线（商品区域的横线）
+            dividers = []
+            for node in ui_nodes:
+                bounds = node.get('bounds')
+                if not bounds:
+                    continue
+
+                # 分割线特征：高度<=5px, 宽度>=50%屏宽, 在商品区域
+                if (bounds['height'] <= 5 and
+                    bounds['width'] >= w * 0.50 and
+                    bounds['left'] > w * 0.20 and
+                    w * 0.15 < bounds['center_y'] < h * 0.85):
+
+                    dividers.append({
+                        'y': bounds['center_y'],
+                        'height': bounds['height'],
+                        'width': bounds['width']
+                    })
+
+            # 按Y坐标排序，取最上面的分割线
+            divider_y = None
+            if dividers:
+                dividers.sort(key=lambda x: x['y'])
+                divider_y = dividers[0]['y']
+                self.logger.debug(f"边界检测: 找到 {len(dividers)} 条分割线, 选择 Y={divider_y}")
+
+            if not divider_y:
+                return (False, None, None)
+
+            # 2. 动态检测下一分类 (从侧边栏)
+            # 这是用户要求的核心逻辑：check orange bar, text below is next category
+            next_category = self._detect_next_category_from_sidebar(ui_nodes)
+
+            # 3. 结果判断
+            if next_category:
+                self.logger.info(f"📍 检测到分类边界: 下一分类标题 '{next_category}' (侧边栏动态识别) 分割线 Y={divider_y}")
+                return (True, next_category, divider_y)
+
+            # 如果没检测到下一分类，但有分割线，依然返回 True，但分类名为 None
+            # 这样外层逻辑至少知道有边界，可以避免错误归类（虽然无法进行修正）
+            self.logger.debug(f"边界检测: 只找到分割线 Y={divider_y}，但未找到下一分类标题")
+            return (True, None, divider_y)
+
+        except Exception as e:
+            self.logger.warning(f"边界检测失败: {e}")
+            return (False, None, None)
         """
         检测右侧商品区域出现的分类标题
         分类标题特征：在分割线下方，文本是已知分类名
@@ -1344,7 +1964,205 @@ class DeviceWorker:
             
         except Exception as e:
             return ""
-    
+
+    def _detect_divider_line(self, ui_nodes: list, category_title_y: int) -> int:
+        """
+        检测分类标题上方的分割线
+
+        Args:
+            ui_nodes: UI节点列表
+            category_title_y: 分类标题的Y坐标
+
+        Returns:
+            分割线Y坐标，未检测到则返回0
+        """
+        try:
+            # 获取屏幕尺寸
+            screen_info = self.automator.device.info
+            screen_width = screen_info.get("displayWidth", 1096)
+            screen_height = screen_info.get("displayHeight", 2560)
+
+            # 分割线特征：
+            # 1. className包含"View"
+            # 2. 高度 <= 5px
+            # 3. 宽度 >= 50%屏宽
+            # 4. 在商品区域(X>20%)
+            # 5. 在分类标题上方0-200px
+
+            min_x = screen_width * 0.20
+            min_width = screen_width * 0.50
+            max_height = 5
+
+            # 搜索范围：分类标题上方0-200px
+            search_min_y = max(0, category_title_y - 200)
+            search_max_y = category_title_y
+
+            candidates = []
+
+            for node in ui_nodes:
+                class_name = node.get('className', '')
+                if 'View' not in class_name:
+                    continue
+
+                bounds = node.get('bounds')
+                if not bounds:
+                    continue
+
+                # 检查尺寸
+                if bounds['height'] > max_height:
+                    continue
+                if bounds['width'] < min_width:
+                    continue
+
+                # 检查位置
+                if bounds['left'] < min_x:
+                    continue
+
+                center_y = bounds['center_y']
+                if not (search_min_y <= center_y <= search_max_y):
+                    continue
+
+                # 符合条件的候选分割线
+                candidates.append({
+                    'y': center_y,
+                    'distance': category_title_y - center_y
+                })
+
+            if not candidates:
+                return 0
+
+            # 返回最接近分类标题的分割线
+            candidates.sort(key=lambda x: x['distance'])
+            return candidates[0]['y']
+
+        except Exception as e:
+            self.logger.debug(f"分割线检测失败: {e}")
+            return 0
+
+    def _detect_left_selected_category(self, ui_nodes: list, expected_category: str) -> bool:
+        """
+        检测左侧选中的分类
+
+        Args:
+            ui_nodes: UI节点列表
+            expected_category: 期望的分类名
+
+        Returns:
+            是否检测到左侧已切换为expected_category
+        """
+        try:
+            # 获取屏幕尺寸
+            screen_info = self.automator.device.info
+            screen_width = screen_info.get("displayWidth", 1096)
+            screen_height = screen_info.get("displayHeight", 2560)
+
+            # 左侧分类区域: X<20%, Y:15%-90%
+            max_x = screen_width * 0.20
+            min_y = screen_height * 0.15
+            max_y = screen_height * 0.90
+
+            # 方法1：从ui_nodes查找 selected='true' 且文本匹配的节点
+            for node in ui_nodes:
+                selected = node.get('selected', 'false')
+                if selected != 'true':
+                    continue
+
+                text = node.get('text', '').strip()
+                if not text:
+                    continue
+
+                # 检查文本是否匹配（完整匹配或部分匹配）
+                if text != expected_category and expected_category not in text:
+                    continue
+
+                bounds = node.get('bounds')
+                if not bounds:
+                    continue
+
+                # 检查位置
+                center_x = bounds['center_x']
+                center_y = bounds['center_y']
+
+                if center_x < max_x and min_y < center_y < max_y:
+                    self.logger.debug(f"检测到左侧选中分类: {text}")
+                    return True
+
+            # 方法2：兜底方案 - 使用device查询
+            try:
+                elem = self.automator.device(text=expected_category, selected=True)
+                if elem.exists(timeout=1):
+                    bounds = elem.info.get('bounds')
+                    if bounds:
+                        center_x = (bounds['left'] + bounds['right']) // 2
+                        center_y = (bounds['top'] + bounds['bottom']) // 2
+                        if center_x < max_x and min_y < center_y < max_y:
+                            self.logger.debug(f"检测到左侧选中分类(兜底): {expected_category}")
+                            return True
+            except:
+                pass
+
+            return False
+
+        except Exception as e:
+            self.logger.debug(f"左侧选中分类检测失败: {e}")
+            return False
+
+    def _get_category_title_y(self, category_name: str, ui_nodes: list) -> int:
+        """
+        获取分类标题的Y坐标
+
+        Args:
+            category_name: 分类名
+            ui_nodes: UI节点列表
+
+        Returns:
+            分类标题Y坐标，未找到则返回0
+        """
+        try:
+            # 获取屏幕尺寸
+            screen_info = self.automator.device.info
+            screen_width = screen_info.get("displayWidth", 1096)
+
+            # 分类标题区域: X: 20%-50%
+            min_x = screen_width * 0.20
+            max_x = screen_width * 0.50
+
+            for node in ui_nodes:
+                text = node.get('text', '').strip()
+                if text != category_name:
+                    continue
+
+                bounds = node.get('bounds')
+                if not bounds:
+                    continue
+
+                center_x = bounds['center_x']
+                if min_x < center_x < max_x:
+                    return bounds['center_y']
+
+            return 0
+
+        except Exception as e:
+            self.logger.debug(f"获取分类标题Y坐标失败: {e}")
+            return 0
+
+    def _update_category_index(self, categories: list, category_name: str):
+        """
+        更新分类索引并保存状态
+
+        Args:
+            categories: 分类列表
+            category_name: 当前分类名
+        """
+        try:
+            if category_name in categories:
+                category_index = categories.index(category_name)
+                self.state_store.current_category_index = category_index
+                self.state_store.save()
+                self.logger.debug(f"分类索引已更新: {category_name} -> {category_index}")
+        except Exception as e:
+            self.logger.debug(f"更新分类索引失败: {e}")
+
     def _click_category(self, category_name: str) -> bool:
         """
         点击分类：先尝试完整文本匹配，失败则尝试部分匹配（解决换行分类问题）
@@ -1407,59 +2225,69 @@ class DeviceWorker:
         # 最后一次尝试
         return self.selector.click_by_text(category_name, timeout=3)
     
-    def _get_category_list(self) -> List[str]:
+    def _get_category_list(self, scroll_rounds: int = 5) -> List[str]:
         """
         获取左侧分类列表
         通过坐标过滤 + 滚动 + 合并换行文本
+
+        Args:
+            scroll_rounds: 滚动次数，默认5次。传入0则只获取当前可见分类，不滚动。
         """
         all_categories = []
-        
+
         try:
             import re
-            
+
             # 获取屏幕尺寸
             screen_info = self.automator.device.info
             screen_width = screen_info.get("displayWidth", 1096)
             screen_height = screen_info.get("displayHeight", 2560)
-            
+
             # 定义左侧分类区域的边界
             max_x = screen_width * 0.20  # 左侧 20% 区域
-            max_y = screen_height * 0.88  # 排除底部 12% 的导航栏
-            min_y = screen_height * 0.25  # 排除顶部 25% 的店铺信息栏
-            
+            max_y = screen_height * 0.90  # 放宽底部限制 (原0.88)
+            min_y = screen_height * 0.15  # 放宽顶部限制 (原0.25)，避免漏掉靠上的分类
+
             # 分类区域的中心X和滑动范围
             category_center_x = int(screen_width * 0.10)
-            
+
             # 黑名单（不包含"推荐"，它是有效分类）
             blacklist = {
-                '问商家', '购物车', '免配送费', '起送', '配送费', '首页', 
+                '问商家', '购物车', '免配送费', '起送', '配送费', '首页',
                 '全部商品', '商家', '销量', '价格', '商家会员',
                 '入会领5元券', '¥20起送'
             }
-            
-            # 滚动获取所有分类（最多滚动5次）
+
+            # 滚动获取所有分类
             scroll_count = 0
-            for scroll_round in range(6):
+            # 如果 scroll_rounds 为 0，则 range(1) 只执行一次不滚动
+            loop_count = scroll_rounds + 1 if scroll_rounds > 0 else 1
+
+            for scroll_round in range(loop_count):
                 # 获取当前可见的分类
                 round_categories = self._get_visible_categories(
                     max_x, min_y, max_y, blacklist
                 )
-                
+
                 # 记录新发现的分类
                 new_count = 0
                 for cat in round_categories:
                     if cat not in all_categories:
                         all_categories.append(cat)
                         new_count += 1
-                
-                self.logger.debug(f"分类滚动第{scroll_round + 1}轮: 本轮发现{len(round_categories)}个, 新增{new_count}个")
-                
+
+                self.logger.debug(f"分类获取第{scroll_round + 1}轮: 本轮发现{len(round_categories)}个, 新增{new_count}个")
+
+                # 如果不要求滚动，直接跳出
+                if scroll_rounds <= 0:
+                    break
+
                 # 如果没有新分类，尝试再滚动一次确认
                 if new_count == 0 and scroll_round > 0:
                     break
-                
+
                 # 在分类区域内向上滑动
-                if scroll_round < 5:
+                if scroll_round < scroll_rounds:
                     start_y = int(screen_height * 0.80)
                     end_y = int(screen_height * 0.35)
                     self.automator.device.swipe(
@@ -1469,8 +2297,8 @@ class DeviceWorker:
                     )
                     scroll_count += 1
                     time.sleep(0.8)
-            
-            # 滚回顶部：反向滑动回去
+
+            # 滚回顶部：反向滑动回去 (只有发生了滚动才滚回)
             if scroll_count > 0:
                 self.logger.debug(f"滚回分类列表顶部...")
                 for _ in range(scroll_count + 1):
@@ -1482,10 +2310,10 @@ class DeviceWorker:
                         duration=0.3
                     )
                     time.sleep(0.5)
-            
+
             self.logger.info(f"共获取到 {len(all_categories)} 个分类")
             return all_categories
-            
+
         except Exception as e:
             self.logger.warning(f"获取分类列表失败: {e}")
             return []
@@ -1598,14 +2426,604 @@ class DeviceWorker:
         
         self.logger.info(f"分类[{category_name}]采集结束: 滑动{scroll_count}次, 本分类采集{self.collected_count}条")
     
+    def _detect_all_category_titles_on_screen(self, ui_nodes: list, category_set: set) -> list:
+        """
+        检测屏幕上所有出现的分类标题及其Y坐标
+
+        ⚠️ 重要：只检测右侧商品区域的分类标题，不包括左侧导航栏
+        右侧商品区域的分类标题是商品列表的分隔符，用于划分不同分类的商品
+
+        Args:
+            ui_nodes: UI节点列表
+            category_set: 已知的分类名称集合
+
+        Returns:
+            [
+                {"name": "儿童用药", "y": 300},
+                {"name": "肿瘤用药", "y": 1500},
+                ...
+            ]
+            按Y坐标从小到大排序
+        """
+        try:
+            # 获取屏幕尺寸，用于区分左侧导航栏和右侧商品区域
+            screen_info = self.automator.device.info
+            screen_width = screen_info.get("displayWidth", 1096)
+            screen_height = screen_info.get("displayHeight", 2560)
+
+            # 区域定义：
+            # - 左侧导航栏：X坐标 < 20%（这里的分类文本是导航用的，不要）
+            # - 右侧商品区域：X坐标 >= 20%（这里的分类文本才是商品列表的分隔符）
+            # - 顶部筛选区域：Y坐标 < 12%（原15%，放宽以检测靠上的标题）
+            sidebar_max_x = screen_width * 0.20
+            top_filter_max_y = screen_height * 0.12
+
+            category_titles = []
+
+            for node in ui_nodes:
+                text = node.get('text', '').strip()
+                if not text:
+                    continue
+
+                # 检查是否为分类标题
+                if text not in category_set:
+                    continue
+
+                bounds = node.get('bounds')
+                if not bounds:
+                    continue
+
+                center_x = bounds['center_x']
+                center_y = bounds['center_y']
+
+                # ✅ 只保留右侧商品区域的分类标题
+                # 排除左侧导航栏（X < 20%）
+                if center_x < sidebar_max_x:
+                    continue
+
+                # 排除顶部筛选标签区域（Y < 15%）
+                if center_y < top_filter_max_y:
+                    continue
+
+                # 记录分类标题及其Y坐标
+                category_titles.append({
+                    "name": text,
+                    "y": center_y
+                })
+
+            # 按Y坐标排序（从上到下）
+            category_titles.sort(key=lambda x: x['y'])
+
+            return category_titles
+
+        except Exception as e:
+            self.logger.warning(f"检测分类标题失败: {e}")
+            return []
+
+    def _build_category_zones(self, category_titles: list, screen_height: int) -> list:
+        """
+        根据分类标题构建分类区间表
+
+        Args:
+            category_titles: 分类标题列表 [{"name": "儿童用药", "y": 300}, ...]
+            screen_height: 屏幕高度
+
+        Returns:
+            [
+                {"name": "儿童用药", "y_start": 0, "y_end": 1200},
+                {"name": "肿瘤用药", "y_start": 1200, "y_end": 2560}
+            ]
+        """
+        if not category_titles:
+            return []
+
+        zones = []
+
+        for i, title in enumerate(category_titles):
+            y_start = 0 if i == 0 else category_titles[i - 1]['y']
+            y_end = category_titles[i + 1]['y'] if i + 1 < len(category_titles) else screen_height
+
+            # 使用当前标题的Y坐标作为起始点（标题下方才是该分类的商品）
+            # 区间为：当前标题Y坐标 到 下一个标题Y坐标
+            zones.append({
+                "name": title['name'],
+                "y_start": title['y'],
+                "y_end": y_end
+            })
+
+        return zones
+
+    def _find_category_by_y(self, y: int, category_zones: list, fallback_category: str) -> str:
+        """
+        根据Y坐标查找商品所属分类
+
+        Args:
+            y: 商品的Y坐标
+            category_zones: 分类区间表
+            fallback_category: 兜底分类（当没有匹配区间时使用）
+
+        Returns:
+            分类名称
+        """
+        if not category_zones:
+            return fallback_category
+
+        # 查找匹配的区间
+        for zone in category_zones:
+            if zone['y_start'] <= y < zone['y_end']:
+                return zone['name']
+
+        # 如果没有匹配，使用最后一个分类（可能是滚动到底部了）
+        if y >= category_zones[-1]['y_start']:
+            return category_zones[-1]['name']
+
+        # 兜底：使用传入的分类
+        return fallback_category
+
+    def _collect_products_by_structure(self, category_name: str, mode: str = "NORMAL", boundary_y: int = 0, next_category: str = "") -> tuple:
+        """
+        【重构核心】基于XML树形结构的商品采集
+        不再依赖坐标推断，而是通过父子节点关系定位商品卡片
+        """
+        import xml.etree.ElementTree as ET
+        import re
+
+        current_new_count = 0
+        next_new_count = 0
+
+        try:
+            # 1. 获取完整XML树
+            xml_content = self.automator.get_page_source()
+            if not xml_content:
+                return (0, 0)
+
+            # 处理可能的编码问题
+            if isinstance(xml_content, bytes):
+                xml_content = xml_content.decode('utf-8', errors='ignore')
+
+            # 移除非法字符避免解析错误
+            xml_content = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', xml_content)
+
+            root = ET.fromstring(xml_content)
+
+            # === 恢复智能区间检测逻辑 ===
+            # 1. 解析扁平化节点用于标题检测
+            ui_nodes = self.automator.parse_hierarchy(xml_content)
+            category_set = set(self.state_store.state.get("categories", []))
+
+            # 2. 检测屏幕上的分类标题
+            category_titles = self._detect_all_category_titles_on_screen(ui_nodes, category_set)
+
+            # 3. 构建Y坐标区间
+            screen_height = self.automator.device.info.get("displayHeight", 2560)
+            category_zones = self._build_category_zones(category_titles, screen_height)
+
+            if category_zones:
+                zones_str = [f"{z['name']}({z['y_start']}-{z['y_end']})" for z in category_zones]
+                self.logger.debug(f"智能分区生效: {zones_str}")
+            # ============================
+
+            # 2. 找到所有价格节点作为锚点
+            price_nodes = []
+
+            # 辅助函数：递归查找价格节点
+            def find_price_nodes(element, ancestors=[]):
+                text = element.attrib.get('text', '')
+                # 匹配价格格式 (¥xx.xx)
+                if re.match(r"^¥?\d+\.?\d*$", text):
+                    # 记录价格节点及其祖先链
+                    price_nodes.append({
+                        'element': element,
+                        'text': text,
+                        'ancestors': ancestors + [element], # 包含自己在内的完整路径
+                        'y': self._get_center_y(element)
+                    })
+
+                # 递归查找子节点
+                current_chain = ancestors + [element]
+                for child in element:
+                    find_price_nodes(child, current_chain)
+
+            find_price_nodes(root)
+
+            self.logger.debug(f"结构化分析: 找到 {len(price_nodes)} 个价格锚点")
+
+            # 3. 遍历每个价格，向上寻找"商品卡片容器"
+            processed_keys = set()
+
+            # 获取屏幕宽高用于过滤
+            screen_width = self.automator.device.info.get("displayWidth", 1096)
+            min_x = screen_width * 0.20 # 排除左侧分类栏
+
+            for p_node in price_nodes:
+                price_text = p_node['text'].replace('¥', '').replace('￥', '')
+                price_y = p_node['y']
+
+                # 过滤左侧分类栏误识别的数字
+                bounds = self._get_bounds(p_node['element'])
+                if bounds and bounds['center_x'] < min_x:
+                    continue
+
+                ancestors = p_node['ancestors']
+                # 从直接父节点开始向上查找，最多找4层（通常卡片在父2或父3）
+                # 倒序遍历祖先: -2是父节点, -3是爷爷...
+                card_found = False
+                best_name = ""
+                monthly_sales = "0"
+
+                # 我们尝试向上找几层，每一层都作为一个潜在的容器
+                for i in range(2, min(7, len(ancestors) + 1)):
+                    parent = ancestors[-i]
+
+                    # 在这个父容器中查找商品名（以 [ 或 【 开头）
+
+                    # 提取该容器下所有文本节点
+                    container_texts = []
+                    def extract_texts(elem):
+                        t = elem.attrib.get('text', '').strip()
+                        if t:
+                            # 计算Y坐标
+                            cy = self._get_center_y(elem)
+                            container_texts.append({'text': t, 'y': cy})
+                        for child in elem:
+                            extract_texts(child)
+
+                    extract_texts(parent)
+
+                    # === 调试日志：针对特定商品输出容器内容 ===
+                    if "77.8" in price_text or "12" in price_text:
+                        self.logger.debug(f"🔍 [调试] 价格 {price_text} (层级-{i}) 容器内容:")
+                        for debug_item in container_texts:
+                            self.logger.debug(f"   -> '{debug_item['text']}' (Y={debug_item['y']})")
+                    # ======================================
+
+                    # 寻找商品名和销量
+                    candidates = []
+                    sales_found = "0"
+
+                    for item in container_texts:
+                        t = item['text']
+                        # 忽略价格本身
+                        if t == p_node['text']:
+                            continue
+
+                        # 查找销量 (只采集"月售"，严格排除"已售")
+                        if '月售' in t:
+                            m = re.search(r'月售\s*(\d+)', t)
+                            if m:
+                                sales_found = m.group(1)
+
+                        # 查找潜在商品名
+                        # 1. 必须在价格上方
+                        if item['y'] >= price_y:
+                            continue
+
+                        # 2. 查找潜在商品名
+                        # 放宽条件：只要包含 [ 或 【 即可，允许前面有标签（如 "健康年 [健安适]..."）
+                        # 并且不能是 "优惠仅剩" 等明显非标题的文本
+                        if ('[' in t or '【' in t) and len(t) > 5:
+                            # 排除特定的营销文案
+                            if any(x in t for x in ["优惠仅剩", "已优惠", "券后", "起送", "配送费"]):
+                                continue
+
+                            # 如果 [ 不在开头，确保它在前面不远处 (比如前10个字符内)
+                            # 避免匹配到 "... [标签] ..." 这种描述性文本
+                            idx = t.find('[') if '[' in t else t.find('【')
+                            if idx > 10:
+                                continue
+
+                            candidates.append(item)
+
+                    if candidates:
+                        # 找到了！这个 parent 就是卡片容器
+                        # 选最靠上的（通常是主标题）
+                        candidates.sort(key=lambda x: x['y'])
+                        best_name = candidates[0]['text']
+                        monthly_sales = sales_found
+                        card_found = True
+                        break # 停止向上查找
+
+                if not card_found:
+                    self.logger.debug(f"⚠️ 价格 {price_text} (Y={price_y}) 未找到对应的商品名容器，跳过")
+                    continue
+
+                # === 找到了一组有效数据 ===
+                # 清理商品名
+                best_name = self._clean_product_name(best_name)
+
+                # === 确定归属分类 (优先级：智能区间 > 边界模式 > 默认) ===
+                target_category = category_name
+
+                if category_zones:
+                    # 优先使用智能区间判断
+                    target_category = self._find_category_by_y(price_y, category_zones, category_name)
+                elif mode == "BOUNDARY" and boundary_y > 0:
+                    # 回退到边界模式
+                    if price_y < boundary_y:
+                        target_category = category_name
+                    else:
+                        target_category = next_category
+                        # 如果是边界模式且位于分界线下方，但不知道下一分类名
+                        # 必须跳过，防止归类到当前分类（Category Drift）
+                        if not target_category:
+                            self.logger.debug(f"⚠️ 价格 {price_text} (Y={price_y}) 位于边界线(Y={boundary_y})下方且无下一分类名，跳过")
+                            continue
+
+                # 前排保护逻辑 (Top 35% 且没有被划分为下一页)
+                # 如果智能区间已经判定了，就不需要这个保护了，或者作为辅助
+                if not category_zones:
+                    screen_height = self.automator.device.info.get("displayHeight", 2560)
+                    if price_y < screen_height * 0.35 and target_category != category_name:
+                         target_category = category_name
+
+                # 生成唯一键去重
+                shop_name = self.state_store.state.get("current_shop_name", "")
+                key = self.state_store.generate_key(shop_name, target_category, best_name, price_text)
+
+                if key in processed_keys:
+                    continue
+                processed_keys.add(key)
+
+                if self.state_store.is_collected(key):
+                    continue
+
+                # 保存
+                record = create_drug_record(
+                    category_name=target_category,
+                    drug_name=best_name,
+                    monthly_sales=monthly_sales,
+                    price=price_text
+                )
+
+                self.exporter.add_record(record)
+                self.state_store.add_collected(key)
+                self.collected_count += 1
+
+                if target_category == category_name:
+                    current_new_count += 1
+                else:
+                    next_new_count += 1
+
+                self.logger.info(f"结构化采集[{target_category}]: {best_name} | ¥{price_text} | 月销{monthly_sales}")
+
+        except Exception as e:
+            self.logger.error(f"结构化采集出错: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+
+        if current_new_count + next_new_count > 0:
+            self.state_store.save()
+
+        return (current_new_count, next_new_count)
+
+    def _get_bounds(self, element):
+        """解析XML元素的bounds属性"""
+        import re
+        bounds_str = element.attrib.get('bounds', '')
+        match = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', bounds_str)
+        if match:
+            left, top, right, bottom = map(int, match.groups())
+            return {
+                'left': left, 'top': top, 'right': right, 'bottom': bottom,
+                'width': right - left, 'height': bottom - top,
+                'center_x': (left + right) // 2,
+                'center_y': (top + bottom) // 2
+            }
+        return None
+
+    def _get_center_y(self, element):
+        b = self._get_bounds(element)
+        return b['center_y'] if b else 0
+
+    def _find_last_product_above_boundary(self, ui_nodes: list, boundary_y: int) -> str:
+        """
+        找到分界线上方最近的一个商品名（锚点商品）
+        """
+        try:
+            # 复用 _collect_products_by_structure 的部分逻辑
+            # 但这里我们只需要找到 Y < boundary_y 且 Y 最大的那个商品
+
+            # 1. 获取所有商品卡片候选
+            # 为了效率，直接重新解析或利用现有结构。
+            # 由于 _collect_products_by_structure 比较复杂，这里简化逻辑：
+            # 查找所有价格元素，向上找商品名，记录 (Y, Name)
+
+            import xml.etree.ElementTree as ET
+            import re
+
+            # 这里的 ui_nodes 是扁平化的，结构化查找需要完整树
+            # 我们可以直接再次调用 get_page_source 吗？会有性能开销。
+            # 但 ui_nodes 已经丢失了树形结构（只保留了部分属性）。
+            # 幸运的是，_run 循环里已经获取了 xml_content，但这里拿不到。
+            # 我们只能重新获取或传入。
+            # 考虑到 _collect_all_categories 里已经有了 ui_nodes (list of dict)，
+            # 但 ui_nodes 不包含层级关系。
+            # 必须重新获取 XML 进行精准定位（为了准确性，值得牺牲一点性能）
+
+            xml_content = self.automator.get_page_source()
+            if not xml_content:
+                return ""
+
+            if isinstance(xml_content, bytes):
+                xml_content = xml_content.decode('utf-8', errors='ignore')
+            xml_content = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', xml_content)
+            root = ET.fromstring(xml_content)
+
+            # 查找所有价格
+            candidates = []
+
+            def find_candidates(element, ancestors=[]):
+                text = element.attrib.get('text', '')
+                if re.match(r"^¥?\d+\.?\d*$", text):
+                    # 这是一个价格，尝试找对应的商品名
+                    price_y = self._get_center_y(element)
+
+                    # 必须在边界上方
+                    if price_y >= boundary_y:
+                        return
+
+                    # 向上寻找商品名
+                    current_chain = ancestors + [element]
+                    best_name = ""
+
+                    # 向上找几层
+                    for i in range(2, min(6, len(current_chain))):
+                        parent = current_chain[-i]
+
+                        # 提取该容器下所有文本
+                        container_texts = []
+                        def extract(elem):
+                            t = elem.attrib.get('text', '').strip()
+                            if t:
+                                cy = self._get_center_y(elem)
+                                container_texts.append({'text': t, 'y': cy})
+                            for child in elem:
+                                extract(child)
+                        extract(parent)
+
+                        # 找名字
+                        potential_names = []
+                        for item in container_texts:
+                            t = item['text']
+                            if t == text: continue # 跳过价格本身
+
+                            # 名字特征：含 [ 或 【，且在价格上方
+                            if ('[' in t or '【' in t) and len(t) > 5 and item['y'] < price_y:
+                                # 排除干扰
+                                if any(x in t for x in ["优惠", "月售", "已售", "起送"]):
+                                    continue
+                                potential_names.append(item)
+
+                        if potential_names:
+                            # 取最靠上的
+                            potential_names.sort(key=lambda x: x['y'])
+                            best_name = potential_names[0]['text']
+                            break
+
+                    if best_name:
+                        cleaned_name = self._clean_product_name(best_name)
+                        candidates.append({'name': cleaned_name, 'y': price_y})
+
+                # 递归
+                new_chain = ancestors + [element]
+                for child in element:
+                    find_candidates(child, new_chain)
+
+            find_candidates(root)
+
+            if not candidates:
+                return ""
+
+            # 按 Y 坐标降序排序（最大的 Y 即最接近边界线的）
+            candidates.sort(key=lambda x: x['y'], reverse=True)
+            return candidates[0]['name']
+
+        except Exception as e:
+            self.logger.error(f"查找锚点商品失败: {e}")
+            return ""
+
+    def _perform_retroactive_correction(self, anchor_name: str, current_category: str, next_category: str) -> int:
+        """
+        回溯修正：检查最近采集的记录，如果包含锚点商品，则将锚点之后的所有商品归类到 next_category
+
+        Args:
+            anchor_name: 锚点商品名（当前分类的最后一个商品）
+            current_category: 当前分类（A）
+            next_category: 下一分类（B）
+
+        Returns:
+            修正的记录数量
+        """
+        try:
+            records = self.exporter.records
+            if not records:
+                return 0
+
+            # 往前查8个
+            search_limit = 8
+            start_idx = max(0, len(records) - search_limit)
+
+            found_idx = -1
+            # 倒序查找锚点
+            for i in range(len(records) - 1, start_idx - 1, -1):
+                if records[i].drug_name == anchor_name:
+                    found_idx = i
+                    break
+
+            if found_idx != -1:
+                self.logger.info(f"🔄 [回溯修正] 在缓存中找到锚点: {anchor_name} (Index={found_idx})")
+
+                fix_count = 0
+                # 从 found_idx + 1 开始，尝试重置为 next_category
+                # 关键逻辑：一旦遇到不属于 current_category 且也不属于 next_category 的商品（说明是Category C），立即停止
+
+                for j in range(found_idx + 1, len(records)):
+                    record = records[j]
+                    old_cat = record.category_name
+
+                    # 安全检查：如果该记录的分类已经是"其它分类"（既不是A也不是B），说明已经进入了C，不能覆盖
+                    # 注意：如果是"A"或"B"或"未知"，我们都可以修正为B。
+                    # 但如果之前已经被修正为C，或者本身采集时就是C，则必须停止。
+                    if old_cat != current_category and old_cat != next_category and old_cat != "未知分类":
+                        self.logger.info(f"🛑 [回溯修正] 遇到第三方分类 '{old_cat}' (商品: {record.drug_name})，停止后续修正")
+                        break
+
+                    # 执行修正
+                    if old_cat != next_category:
+                        record.category_name = next_category
+                        fix_count += 1
+                        self.logger.info(f"    -> 修正: {record.drug_name} | {old_cat} => {next_category}")
+
+                if fix_count > 0:
+                    self.logger.info(f"✅ 回溯修正完成: 修正了 {fix_count} 条记录")
+                    return fix_count
+            else:
+                self.logger.debug(f"⚠️ [回溯修正] 最近 {search_limit} 条记录中未找到锚点: {anchor_name}")
+                return 0
+
+        except Exception as e:
+            self.logger.error(f"回溯修正异常: {e}")
+            return 0
+
+    def _collect_visible_products_with_boundary(
+        self,
+        current_category: str,
+        ui_nodes: list,
+        mode: str = "NORMAL",
+        divider_y: int = None,
+        next_category: str = None
+    ) -> tuple:
+        """
+        采集当前可见区域的商品（支持边界模式）
+        代理方法：直接调用结构化采集
+        """
+        # 兼容性处理
+        dy = divider_y if divider_y is not None else 0
+        nc = next_category if next_category is not None else ""
+        return self._collect_products_by_structure(current_category, mode, dy, nc)
+
     def _collect_visible_products(self, category_name: str, ui_nodes: list = None) -> int:
         """
-        采集当前可见区域的商品
+        采集当前可见区域的商品（兼容接口）
         策略：以价格元素(¥XX.XX)为锚点定位商品卡片，通过坐标关联查找商品名
-        
+
         Args:
             category_name: 当前分类名
             ui_nodes: 预解析的UI节点列表（如果提供则直接使用，否则查询设备）
+        """
+        # 向后兼容：调用新函数的NORMAL模式
+        if ui_nodes is None:
+            self.logger.warning("未传入ui_nodes，_collect_visible_products 性能将受限")
+            return 0
+
+        new_count, _ = self._collect_visible_products_with_boundary(
+            category_name, ui_nodes, "NORMAL"
+        )
+        return new_count
+
+    def _collect_visible_products_legacy(self, category_name: str, ui_nodes: list = None) -> int:
+        """
+        采集当前可见区域的商品（原始逻辑，保留用于降级）
         """
         new_count = 0
         
@@ -1678,76 +3096,85 @@ class DeviceWorker:
             
             self.logger.debug(f"找到 {len(price_items)} 个价格元素")
             
-            # === 第三步：为每个价格找到对应的商品名 ===
-            # 规则：商品名应该在价格的上方，且X坐标接近
+            # === 第三步：全新重构 - 基于结构特征的匹配 ===
+            # 策略：商品名([开头) -> 月售(中间) -> 价格(底部)
+
+            # 1. 识别所有可能的商品名（必须以 [ 或 【 开头）
+            product_name_candidates = []
+            for item in text_items:
+                text = item['text']
+                if text.startswith('[') or text.startswith('【'):
+                    product_name_candidates.append(item)
+
+            # 2. 为每个价格寻找匹配的商品名
             for price_item in price_items:
                 price_text = price_item['text']
                 price_y = price_item['y']
                 price_x = price_item['x']
-                
-                # 查找价格上方的商品名
-                # 商品名特征：在价格上方 50-250px，X坐标在同一列
-                candidate_names = []
-                for text_item in text_items:
-                    text = text_item['text']
-                    text_y = text_item['y']
-                    text_x = text_item['x']
-                    
-                    # 位置检查：在价格上方
-                    y_diff = price_y - text_y
-                    if y_diff < 30 or y_diff > 250:  # 上方30-250px范围内
+
+                # 在价格上方寻找最近的一个合法商品名
+                best_name_item = None
+                min_y_dist = float('inf')
+
+                for name_item in product_name_candidates:
+                    name_y = name_item['y']
+                    name_x = name_item['x']
+
+                    # 必须在价格上方
+                    if name_y >= price_y:
                         continue
-                    
-                    # X坐标接近（同一列）
-                    x_diff = abs(text_x - price_x)
-                    if x_diff > 300:  # X偏差不超过300px
+
+                    # 水平偏差不能太大 (同列)
+                    if abs(name_x - price_x) > 300:
                         continue
-                    
-                    # 排除明显不是商品名的文本
-                    if self._is_invalid_product_name(text):
+
+                    # 计算垂直距离
+                    dist = price_y - name_y
+
+                    # 距离限制 (放宽到 600px，确保能跨过营销标签)
+                    if dist > 600:
                         continue
-                    
-                    candidate_names.append({
-                        'text': text,
-                        'y_diff': y_diff,
-                        'x_diff': x_diff
-                    })
-                
-                if not candidate_names:
+
+                    # 找离价格最近的那个 [商品名] (通常只有一个，如果有多个，最近的应该是所属关系)
+                    # 修正：通常商品名在卡片顶部，价格在底部。中间可能有其他[标签]。
+                    # 但根据用户反馈，"药品名是[开头的...跟左侧图片顶部平齐"。
+                    # 我们寻找价格上方最近的那个“合法头部”。
+                    if dist < min_y_dist:
+                        min_y_dist = dist
+                        best_name_item = name_item
+
+                if not best_name_item:
                     continue
-                
-                # 选择最佳匹配（优先Y坐标最接近的）
-                candidate_names.sort(key=lambda x: x['y_diff'])
-                best_name = candidate_names[0]['text']
-                
-                # === 清理商品名前缀乱码（如 TTTTT[品牌] -> [品牌]）===
-                # 这些乱码是图片标签（如"健康年"标签）被识别成的替代字符
-                best_name = self._clean_product_name(best_name)
-                
-                # === 检查是否有月售信息 ===
-                # 月售在价格上方，商品名和价格之间（垂直方向）
+
+                best_name = best_name_item['text']
+                name_y = best_name_item['y']
+
+                # === 查找月售信息 (在商品名和价格之间的区域) ===
                 monthly_sales = "0"
                 for text_item in text_items:
                     text = text_item['text']
-                    text_y = text_item['y']
-                    text_x = text_item['x']
-                    
-                    # 月售在价格上方 0-150px 范围内
-                    y_diff = price_y - text_y
-                    if y_diff < 0 or y_diff > 150:
+                    tx = text_item['x']
+                    ty = text_item['y']
+
+                    # 必须在商品名和价格之间
+                    if not (name_y < ty < price_y):
                         continue
-                    
-                    # X坐标接近（同一列）
-                    x_diff = abs(text_x - price_x)
-                    if x_diff > 300:
+
+                    # 水平位置限制
+                    if abs(tx - price_x) > 350:
                         continue
-                    
-                    # 只查找包含"月售"的文本
-                    if '月售' in text:
-                        match = re.search(r'月售(\d+)', text)
+
+                    # 匹配月售/已售
+                    if '月售' in text or '已售' in text:
+                        match = re.search(r'(?:月售|已售)\s*(\d+)', text)
                         if match:
                             monthly_sales = match.group(1)
-                        break
+                            break # 找到即止
+
+                # 清理商品名
+                best_name = self._clean_product_name(best_name)
+
+                # === 根据模式确定商品归属分类 ===
                 
                 # === 去重检查并保存 ===
                 # generate_key 必须包含 shop_name（从 state_store 获取）
@@ -1818,23 +3245,31 @@ class DeviceWorker:
     
     def _clean_product_name(self, name: str) -> str:
         """
-        清理商品名中的前缀乱码
-        例如: TTTTT[力度伸]维生素C... -> [力度伸]维生素C...
+        清理商品名中的前缀乱码和营销标签
+        例如:
+        - TTTTT[力度伸]维生素C... -> [力度伸]维生素C...
+        - 健康年 [健安适]... -> [健安适]...
         """
         import re
-        
+
         if not name:
             return name
-        
+
+        # 移除常见的干扰前缀 (根据用户反馈添加 "健康年")
+        prefixes_to_remove = ["健康年"]
+        for prefix in prefixes_to_remove:
+            if prefix in name:
+                name = name.replace(prefix, "").strip()
+
         # 查找第一个方括号或中文字符的位置
         # 商品名通常以 [品牌名] 或中文开头
         match = re.search(r'[\[\u4e00-\u9fa5]', name)
-        
-        if match and match.start() > 0:
-            # 如果在开头发现非中文非方括号字符，从第一个有效字符开始截取
+
+        if match:
+            # 如果找到了 [ 或 【，直接从这里开始截取
             cleaned = name[match.start():]
             return cleaned
-        
+
         return name
     
     def get_status_text(self) -> str:

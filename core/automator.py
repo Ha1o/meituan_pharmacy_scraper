@@ -476,7 +476,8 @@ class DeviceAutomator:
                 class_name = node.get('class', '')
                 bounds_str = node.get('bounds', '')
                 content_desc = node.get('content-desc', '')
-                
+                selected = node.get('selected', 'false')  # 新增：支持selected属性
+
                 # 解析坐标 [0,0][1080,1920]
                 bounds = None
                 if bounds_str:
@@ -493,7 +494,7 @@ class DeviceAutomator:
                             'center_x': (left + right) // 2,
                             'center_y': (top + bottom) // 2
                         }
-                
+
                 # 只有包含有用信息的节点才保留
                 if text or content_desc or resource_id or bounds:
                     nodes.append({
@@ -501,7 +502,8 @@ class DeviceAutomator:
                         'content_desc': content_desc,
                         'resourceId': resource_id,
                         'className': class_name,
-                        'bounds': bounds
+                        'bounds': bounds,
+                        'selected': selected  # 新增：返回selected属性
                     })
                 
                 for child in node:

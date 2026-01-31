@@ -1,0 +1,25 @@
+{
+  "current_task_index": 0,
+  "current_shop_name": "",
+  "current_category_index": 1,
+  "current_category_name": "全身用药",
+  "scroll_round": 0,
+  "collected_keys": [
+    "|感冒用药|感冒灵A1|15.0",
+    "|感冒用药|感冒灵A2|16.0",
+    "|感冒用药|感冒灵A3|17.0",
+    "|感冒用药|感冒灵A_Last|18.0",
+    "|全身用药|布洛芬B1|25.0",
+    "|全身用药|布洛芬B2|26.0",
+    "|全身用药|布洛芬B3|27.0"
+  ],
+  "collected_count": 7,
+  "last_update": "2026-01-31 03:13:59",
+  "status": "idle",
+  "all_categories": [
+    "感冒用药",
+    "全身用药"
+  ],
+  "risk_control_hit": false,
+  "current_poi": ""
+}

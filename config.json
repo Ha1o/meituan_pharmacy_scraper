@@ -13,8 +13,15 @@
     "scroll": {
         "max_scroll_times": 10000,
         "scroll_duration": 0.5,
-        "scroll_pause": 0.8,
+        "scroll_pause": 1.2,
+        "boundary_mode_pause": 1.5,
+        "verify_mode_pause": 1.0,
         "no_new_data_threshold": 3
+    },
+    "features": {
+        "enable_boundary_mode": true,
+        "boundary_mode_strict": true,
+        "verify_screen_threshold": 10
     },
     "retry": {
         "max_retries": 3,

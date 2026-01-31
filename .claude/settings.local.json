@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(adb devices:*)",
+      "Bash(dir:*)",
+      "Bash(ls:*)",
+      "Bash(python:*)",
+      "Bash(claude:*)",
+      "Bash(npm update -g @anthropic-ai/claude-code)",
+      "Bash(findstr:*)",
+      "Bash(timeout:*)"
+    ]
+  }
+}

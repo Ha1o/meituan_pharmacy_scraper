@@ -46,37 +46,40 @@ class StateStore:
             "status": "idle",                  # 状态: idle/running/paused/completed/error
             "all_categories": [],              # 完整分类列表（恢复时使用）
             "risk_control_hit": False,         # 是否因风控暂停
-            "current_poi": ""                  # 当前定位点（恢复时使用）
+            "current_poi": "",                 # 当前定位点（恢复时使用）
+            "switch_mode": "NORMAL",           # 当前切换模式: NORMAL/BOUNDARY/VERIFYING
+            "next_category": "",               # 下一个分类名
+            "boundary_divider_y": 0,           # 边界分割线Y坐标
+            "boundary_products": [],           # 边界商品key列表
+            "verify_screen_count": 0           # 验证模式已滑动屏数
         }
         
         # 去重集合（内存中使用set加速查找）
         self.collected_keys_set: Set[str] = set()
     
     def generate_key(
-        self, 
+        self,
         shop_name: str,
-        category_name: str, 
-        drug_name: str, 
+        category_name: str,
+        drug_name: str,
         price: str
     ) -> str:
         """
-        生成去重key（必须包含shop_name，确保多店铺不冲突）
-        
+        生成去重key（仅使用店铺名+药品名，确保绝对唯一，忽略分类和价格变化）
+
         Args:
             shop_name: 店铺名（必填）
-            category_name: 分类名
+            category_name: 分类名（不参与去重）
             drug_name: 药品名
-            price: 价格
-            
+            price: 价格（不参与去重）
+
         Returns:
-            去重key字符串: shop_name|category|drug_name|price
+            去重key字符串: shop_name|drug_name
         """
-        # 清理空格和特殊字符，key格式: shop_name|category|drug_name|price
+        # 清理空格和特殊字符，key格式: shop_name|drug_name
         parts = [
             shop_name.strip(),
-            category_name.strip(),
-            drug_name.strip(),
-            price.strip().replace('¥', '').replace('￥', '')
+            drug_name.strip()
         ]
         return "|".join(parts)
     
@@ -153,7 +156,12 @@ class StateStore:
             "status": "idle",
             "all_categories": [],
             "risk_control_hit": False,
-            "current_poi": ""
+            "current_poi": "",
+            "switch_mode": "NORMAL",
+            "next_category": "",
+            "boundary_divider_y": 0,
+            "boundary_products": [],
+            "verify_screen_count": 0
         }
         self.collected_keys_set.clear()
         
@@ -267,3 +275,30 @@ class StateStore:
             f"分类:{self.current_category_index + 1}, "
             f"采集:{self.collected_count}条"
         )
+
+    def enter_boundary_mode(self, next_category: str, divider_y: int):
+        """
+        进入边界模式
+
+        Args:
+            next_category: 下一个分类名
+            divider_y: 边界分割线Y坐标
+        """
+        self.state["switch_mode"] = "BOUNDARY"
+        self.state["next_category"] = next_category
+        self.state["boundary_divider_y"] = divider_y
+        self.state["boundary_products"] = []
+        self.state["verify_screen_count"] = 0
+
+    def enter_verifying_mode(self):
+        """进入验证模式"""
+        self.state["switch_mode"] = "VERIFYING"
+        self.state["verify_screen_count"] = 0
+
+    def exit_boundary_mode(self):
+        """退出边界模式，回到正常模式"""
+        self.state["switch_mode"] = "NORMAL"
+        self.state["next_category"] = ""
+        self.state["boundary_divider_y"] = 0
+        self.state["boundary_products"] = []
+        self.state["verify_screen_count"] = 0
